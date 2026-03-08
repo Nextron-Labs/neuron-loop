@@ -1133,9 +1133,12 @@ def main():
                                 Path(fp).write_text(new_content)
                                 break
 
+                        old_lines = old_content.count('\n') + 1
+                        new_lines = new_content.count('\n') + 1
                         logger.info(f"Updated {filename}: {applied} applied, {failed} failed "
-                                    f"({len(old_content)} → {len(new_content)} chars)")
+                                    f"({old_lines} → {new_lines} lines)")
                         logger.event("file_updated", iteration=iteration, filename=filename,
+                                     old_lines=old_lines, new_lines=new_lines,
                                      old_size=len(old_content), new_size=len(new_content),
                                      patches_applied=applied, patches_failed=failed)
                     else:
@@ -1157,7 +1160,8 @@ def main():
                                     if Path(fp).name == filename:
                                         Path(fp).write_text(new_code)
                                         break
-                                logger.info(f"Fallback: updated {filename} ({old_len} → {new_len})")
+                                logger.info(f"Fallback: updated {filename} ({old_len} → {new_len} chars, "
+                                            f"{files_content[filename].count(chr(10))+1} → {new_code.count(chr(10))+1} lines)")
 
                     if not files_updated:
                         logger.warn("No files updated, breaking loop")
@@ -1179,7 +1183,9 @@ def main():
                                 if Path(fp).name == filename:
                                     Path(fp).write_text(new_code)
                                     break
-                            logger.info(f"Updated {filename} ({old_len} → {new_len} chars)")
+                            old_lines = files_content[filename].count('\n') + 1
+                            new_lines = new_code.count('\n') + 1
+                            logger.info(f"Updated {filename} ({old_lines} → {new_lines} lines)")
 
                 if not files_updated:
                     logger.warn("No files updated, breaking loop")
