@@ -1,0 +1,485 @@
+[
+  {
+    "finding": {
+      "id": "F1",
+      "severity": "CRITICAL",
+      "location": "scan_directory / progress detection block (duplicated before pcall)",
+      "title": "Duplicate code block causes scan_directory to never execute file processing",
+      "description": "The source file contains a literal '>>>REPLACE' marker and a duplicated block of code starting with 'local show_progress = config.progress'. The first copy of the block (before '>>>REPLACE') is never closed with a pcall/end, and the second copy (after '>>>REPLACE') contains the actual pcall with the file-processing loop. As written, the Lua parser will encounter the duplicate local declarations and the stray '>>>REPLACE' text, causing a syntax error that prevents the entire script from loading. Even if the marker were removed, the duplicate variable declarations would shadow each other and the first block would fall through without processing any files.",
+      "impact": "The script will fail to parse/load entirely. No files will be scanned or uploaded on any target system.",
+      "suggestion": "Remove the first (incomplete) copy of the show_progress/progress_counter block and the '>>>REPLACE' marker, keeping only the version inside the pcall. The function should read:\n\n```lua\nfunction scan_directory(dir, api_endpoint)\n    if not exec_ok(\"test -d \" .. shell_quote(dir)) then\n        log_msg(\"warn\", \"Skipping non-directory path '\" .. dir .. \"'\")\n        return\n    end\n    log_msg(\"info\", \"Scanning '\" .. dir .. \"'\")\n    local cmd = build_find_command(dir)\n    log_msg(\"debug\", \"find command: \" .. cmd)\n    local handle = io.popen(cmd)\n    if not handle then\n        log_msg(\"error\", \"Could not start find for '\" .. dir .. \"'\")\n        counters.files_failed = counters.files_failed + 1\n        return\n    end\n    local show_progress = config.progress\n    if show_progress == nil then\n        show_progress = exec_ok(\"test -t 2\")\n    end\n    local dir_files_scanned = 0\n    local progress_counter = 0\n    local ok, scan_err = pcall(function()\n        for file_path in handle:lines() do\n            -- ... processing ...\n        end\n    end)\n    handle:close()\n    -- ... rest of function\nend\n```",
+      "false_positive_risk": "low"
+    },
+    "models": [
+      "sonnet"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F2",
+      "severity": "CRITICAL",
+      "location": "main / second '>>>REPLACE' marker",
+      "title": "Second stray '>>>REPLACE' marker causes syntax error in main()",
+      "description": "There is a second '>>>REPLACE\\n(move randomseed to top of main)' comment block inserted in the middle of the main() function body, between the 'Record start time' block and the 'Send begin marker' block. This is not valid Lua syntax and will cause a parse error, preventing the script from running.",
+      "impact": "Script fails to load entirely; no collection occurs.",
+      "suggestion": "Remove the '>>>REPLACE\\n(move randomseed to top of main)' lines. The math.randomseed call is already correctly placed at the top of main(), so no code movement is needed\u2014just delete the marker.",
+      "false_positive_risk": "low"
+    },
+    "models": [
+      "sonnet"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F1",
+      "severity": "HIGH",
+      "location": "scan_directory / duplicated block around the >>>REPLACE marker",
+      "title": "Script contains unresolved patch markers and duplicated code, making it syntactically invalid",
+      "description": "The file still includes literal `>>>REPLACE` markers and replacement notes such as `(move randomseed to top of main)`. These are not Lua comments and will cause a parse error before execution. In addition, the surrounding code is duplicated in `scan_directory`, so the checked-in file is not runnable as-is.",
+      "impact": "The collector will fail to start at all on target systems, resulting in no scanning, no uploads, and no collection markers.",
+      "suggestion": "Remove the patch markers and keep only the intended final code. Ensure `scan_directory` contains a single progress-detection block and that `main()` contains only valid Lua statements. Run `lua -p thunderstorm-collector.lua` or equivalent syntax validation before release.",
+      "false_positive_risk": "low"
+    },
+    "models": [
+      "gpt54"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F2",
+      "severity": "HIGH",
+      "location": "mktemp / fallback branch using io.open(path, \"wb\")",
+      "title": "Temporary-file fallback is vulnerable to symlink clobbering and races",
+      "description": "When `mktemp` is unavailable, the code generates `/tmp/thunderstorm.<suffix>` and creates it with `io.open(..., \"wb\")`. On multi-user or adversarial systems, an attacker can pre-create that path as a symlink to another file. Opening with `wb` follows symlinks and truncates the target. The random suffix reduces predictability but does not provide atomic creation or symlink protection.",
+      "impact": "This can overwrite arbitrary writable files, corrupt logs/configuration, or redirect request/response temp files in unsafe ways. `/tmp` is explicitly attacker-controlled on many systems.",
+      "suggestion": "Do not implement a non-atomic temp-file fallback with plain `io.open`. Prefer requiring a real `mktemp` utility, or create a private temp directory with restrictive permissions and use shell `mktemp` inside it. If no safe primitive exists in pure Lua 5.1, fail closed with a fatal error instead of creating insecure temp files.",
+      "false_positive_risk": "low"
+    },
+    "models": [
+      "gpt54"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F3",
+      "severity": "HIGH",
+      "location": "scan_directory / after handle:close()",
+      "title": "Find command failures are silently ignored, so partial scans can exit as clean",
+      "description": "The code reads `find` output via `io.popen(cmd)` and then calls `handle:close()`, but it never inspects the close status. `find` commonly exits non-zero on traversal errors, I/O errors, or permission problems even when some paths were emitted. The comment explicitly says partial results are treated as valid, but the hardened behavior requested for the other collectors is to reflect partial failures in the exit code. As written, a directory scan can miss files due to runtime errors and still return exit code 0 if uploads succeeded.",
+      "impact": "Operators may believe the collection completed cleanly when it actually skipped parts of the filesystem. This weakens incident response and parity with the hardened collectors' exit-code contract.",
+      "suggestion": "Capture and evaluate the `find` exit status. If it is non-zero, log to stderr and increment a partial-failure counter so the process exits 1. If BusyBox/Lua version differences make `popen():close()` status awkward, redirect `find` exit code to a temp file or wrap the command in `sh -c 'find ...; echo $? >status'`.",
+      "false_positive_risk": "low"
+    },
+    "models": [
+      "gpt54"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F3",
+      "severity": "HIGH",
+      "location": "build_multipart_body / boundary collision check",
+      "title": "Boundary collision check misses the preamble and epilogue themselves",
+      "description": "The collision check searches the file content for '\\r\\n--' .. candidate, but the actual boundary delimiter that appears at the very start of the body is '--' .. boundary (no leading \\r\\n). If the file begins with bytes that match '--<boundary>', the preamble delimiter will collide with file content and corrupt the multipart message. The check should also cover '--' .. candidate at position 1 (start of body) and '--' .. candidate .. '--' (epilogue).",
+      "impact": "A file whose first bytes happen to match the boundary string will produce a malformed multipart body, causing the server to reject the upload or misparse it. On embedded targets with limited retry budgets this means silent data loss.",
+      "suggestion": "Also check for the plain '--' .. candidate pattern (without leading \\r\\n) to cover the opening delimiter:\n```lua\nlocal needle1 = \"\\r\\n--\" .. candidate\nlocal needle2 = \"--\" .. candidate  -- covers opening delimiter\nif search_buf:find(needle1, 1, true) or search_buf:find(needle2, 1, true) then\n    collision = true\n    break\nend\n```",
+      "false_positive_risk": "low"
+    },
+    "models": [
+      "sonnet"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F4",
+      "severity": "HIGH",
+      "location": "upload_with_nc / HTTP response check",
+      "title": "nc upload silently succeeds on HTTP error responses that contain a 2xx line elsewhere",
+      "description": "The response check uses `resp:match(\"HTTP/1%.%d 2%d%d\")` which searches anywhere in the response body. A server that returns HTTP 400 with a JSON body containing the string 'HTTP/1.1 200' (e.g., in an error description or echoed request) would be incorrectly treated as a success. The status line must be anchored to the beginning of the response.",
+      "impact": "Failed uploads are silently counted as successful; files are not retried and counters.files_failed is not incremented.",
+      "suggestion": "Anchor the match to the start of the response:\n```lua\nif resp:match(\"^HTTP/1%.%d 2%d%d\") then return true end\n```",
+      "false_positive_risk": "low"
+    },
+    "models": [
+      "sonnet"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F5",
+      "severity": "HIGH",
+      "location": "submit_file / temp file cleanup loop",
+      "title": "Temp file list truncation uses table.remove in reverse but leaves holes after partial removal",
+      "description": "After each upload attempt the code removes temp files created during that attempt and then truncates the `temp_files` table by calling `table.remove(temp_files, i)` in a reverse loop from `#temp_files` down to `temps_before + 1`. However, `temps_before` is captured once before the retry loop. On the second and subsequent attempts, new temp files are appended starting at index `temps_before + 1` again (since the list was truncated), so the cleanup is correct for the indices\u2014but if `build_multipart_body` or an upload function fails mid-way and leaves fewer entries than expected, the loop bounds may be wrong. More critically, the `os.remove` loop and the `table.remove` loop are separate: if `os.remove` succeeds but the script is interrupted between the two loops, entries remain in `temp_files` and will be double-removed by `cleanup_temp_files()` at exit (harmless but indicative of fragile design). The real bug is that `temps_before` is not updated between retries, so if a retry creates a different number of temp files than the first attempt, the truncation index is wrong.",
+      "impact": "Temp files from failed attempts may not be deleted, leaking disk space on memory-constrained embedded devices. On a device with 2 MB RAM and a /tmp on tmpfs this can cause subsequent uploads to fail.",
+      "suggestion": "Reset `temps_before` at the start of each retry iteration:\n```lua\nfor attempt = 1, config.retries do\n    local temps_before = #temp_files  -- capture inside loop\n    local success = false\n    -- ... upload ...\n    -- cleanup\n    for i = #temp_files, temps_before + 1, -1 do\n        os.remove(temp_files[i])\n        table.remove(temp_files, i)\n    end\n    if success then return true end\n    -- ...\nend\n```",
+      "false_positive_risk": "low"
+    },
+    "models": [
+      "sonnet"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F6",
+      "severity": "HIGH",
+      "location": "upload_with_curl / cmd construction",
+      "title": "Missing -X POST flag in curl upload command causes GET request",
+      "description": "The curl command in `upload_with_curl` uses `--data-binary @file` which implicitly sets the method to POST in modern curl versions, but the explicit `-X POST` flag present in the collection marker curl command is absent here. Some older curl versions (common on embedded/OpenWrt systems) require the explicit flag when combined with `--fail --show-error`. More importantly, the format string has `%s%s%s` for insecure+ca_cert+endpoint but the endpoint is shell_quote'd as the third %s while the Content-Type header (-H) comes after\u2014this means the endpoint URL appears before the -H flag, which is valid, but the `-X POST` is missing entirely.",
+      "impact": "On older curl builds the upload may be sent as a GET request, which the Thunderstorm server will reject. Files will fail to upload silently (curl --fail will return non-zero but the error message may be confusing).",
+      "suggestion": "Add `-X POST` explicitly:\n```lua\nlocal cmd = string.format(\n    \"curl -sS --fail --show-error -X POST %s%s\" ..\n    \" --connect-timeout 30 --max-time 120\" ..\n    \" -H %s --data-binary @%s -o %s 2>%s %s\",\n    insecure, ca_cert_flag,\n    shell_quote(\"Content-Type: multipart/form-data; boundary=\" .. boundary),\n    shell_quote(body_file),\n    shell_quote(resp_file),\n    shell_quote(err_file),\n    shell_quote(endpoint)\n)\n```\nNote also that the endpoint argument should come last in curl invocations.",
+      "false_positive_risk": "medium"
+    },
+    "models": [
+      "sonnet"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F7",
+      "severity": "HIGH",
+      "location": "build_find_command",
+      "title": "find -mtime predicate semantics: -mtime -N finds files modified less than N*24h ago, not N days",
+      "description": "The command uses `-mtime -<max_age>` which on POSIX find means files modified less than max_age*24 hours ago (rounded down to whole days). With max_age=14 this finds files modified in the last 13-14 days depending on the current time of day. This is the standard behavior and matches the other collectors, so it is not a bug per se\u2014but the validate_config check `max_age == 0` correctly rejects 0. However, the comment 'Max file age in days' in the config is slightly misleading since -mtime -1 finds files modified less than 24h ago (i.e., today only). This is a documentation issue rather than a code bug, so severity is noted but the real issue is that `-mtime -0` is explicitly rejected but `-mtime -1` finds files from the last 24h which may surprise users expecting 'last 1 day' to mean 'yesterday and today'.",
+      "impact": "Low operational impact; files slightly outside the expected window may be missed or included.",
+      "suggestion": "This is acceptable behavior matching POSIX find semantics. Update the help text to say 'Max file age in days (uses find -mtime; -mtime -N finds files modified less than N\u00d724h ago)'.",
+      "false_positive_risk": "high"
+    },
+    "models": [
+      "sonnet"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F8",
+      "severity": "HIGH",
+      "location": "send_collection_marker / nc path",
+      "title": "nc collection marker path uses #body (byte count) but body may contain multi-byte sequences",
+      "description": "The Content-Length header is set to `#body` where body is a Lua string. In Lua 5.1, `#` on a string returns the number of bytes, which is correct for Content-Length. However, `json_escape` can produce `\\uXXXX` sequences for control characters, and the source name could contain UTF-8 multi-byte sequences that are passed through unescaped (json_escape only escapes control chars 0x00-0x1F, not high bytes). The byte count will still be correct since Lua strings are byte arrays. This is actually fine\u2014marking as high only because the interaction with the nc HTTP/1.0 raw request is fragile: if the body string contains a NUL byte (impossible here since JSON values are escaped) it would truncate. Since json_escape is applied, this is safe.",
+      "impact": "Minimal; Content-Length will be correct.",
+      "suggestion": "No code change needed; add a comment confirming that #body is byte-accurate in Lua 5.1.",
+      "false_positive_risk": "high"
+    },
+    "models": [
+      "sonnet"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F4",
+      "severity": "MEDIUM",
+      "location": "send_collection_marker / scan_id extraction",
+      "title": "Fallback scan_id parser can return escaped JSON fragments instead of the real value",
+      "description": "The strict pattern only accepts `[A-Za-z0-9_%.%-]+`. If the server returns a valid JSON string containing any escaped character, the fallback pattern `\"scan_id\"%s*:%s*\"([^\"]*)\"` stops at the first embedded escaped quote sequence and returns the raw escaped fragment rather than the decoded string. That malformed value is then appended to the upload endpoint as `scan_id=...`.",
+      "impact": "Uploads may be associated with the wrong scan or rejected entirely if the server ever changes scan_id format. This is a correctness bug in marker-to-upload correlation.",
+      "suggestion": "Either constrain the server contract and reject non-simple scan IDs explicitly, or implement minimal JSON string parsing for this field that honors backslash escapes before using the value.",
+      "false_positive_risk": "medium"
+    },
+    "models": [
+      "gpt54"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F5",
+      "severity": "MEDIUM",
+      "location": "send_collection_marker / tool fallback logic",
+      "title": "Begin/end markers are skipped when only nc is available and upload tool was not pre-detected",
+      "description": "Inside `send_collection_marker`, if `config.upload_tool` is empty, the fallback detection checks only `curl` and `wget`; it does not consider `nc`. Today `main()` usually calls `detect_upload_tool()` first in non-dry-run mode, but this function is written as a general fallback and will incorrectly skip marker sending in any path where the upload tool was not pre-populated and only `nc` exists.",
+      "impact": "Collection markers can be lost on minimal systems that rely on `nc`, breaking scan lifecycle tracking and parity with the other collectors.",
+      "suggestion": "Reuse `detect_upload_tool()` or mirror its full logic, including `nc` selection for non-SSL URLs. Avoid maintaining a second, incomplete tool-detection path.",
+      "false_positive_risk": "low"
+    },
+    "models": [
+      "gpt54"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F6",
+      "severity": "MEDIUM",
+      "location": "main / end-marker send result ignored",
+      "title": "End marker delivery failures do not affect exit status",
+      "description": "The script sends the final `end` collection marker but ignores whether it succeeded. The hardened behavior described for the other collectors emphasizes partial-failure reporting. If all file uploads succeed but the end marker fails, the script still exits 0, even though the server-side collection state is incomplete.",
+      "impact": "Operational tooling may treat the run as fully successful while the Thunderstorm server never receives completion metadata or final stats.",
+      "suggestion": "Have `send_collection_marker` return success separately from `scan_id`, and treat begin/end marker failures as partial failures that produce exit code 1 (unless you intentionally document a different contract).",
+      "false_positive_risk": "medium"
+    },
+    "models": [
+      "gpt54"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F9",
+      "severity": "MEDIUM",
+      "location": "is_cloud_path",
+      "title": "Pre-computed cloud pattern tables (_cloud_mid_patterns, _cloud_end_suffixes) are never used",
+      "description": "The function `_init_cloud_patterns()` populates `_cloud_mid_patterns` and `_cloud_end_suffixes` at module load time, but `is_cloud_path()` ignores these tables entirely and re-constructs the patterns inline by iterating `CLOUD_DIR_NAMES` and doing string concatenation on every call. The optimization is dead code.",
+      "impact": "On embedded systems scanning thousands of files, the repeated string allocation per file adds unnecessary GC pressure. The pre-computed tables exist but provide no benefit.",
+      "suggestion": "Either use the pre-computed tables in is_cloud_path:\n```lua\nfunction is_cloud_path(path)\n    local lower = path:lower()\n    for _, pat in ipairs(_cloud_mid_patterns) do\n        if lower:find(pat, 1, true) then return true end\n    end\n    for _, suf in ipairs(_cloud_end_suffixes) do\n        if lower:sub(-(#suf)) == suf then return true end\n    end\n    -- macOS check ...\n    return false\nend\n```\nor remove `_init_cloud_patterns` and the two tables if the optimization is not desired.",
+      "false_positive_risk": "low"
+    },
+    "models": [
+      "sonnet"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F10",
+      "severity": "MEDIUM",
+      "location": "upload_with_nc / URL parsing",
+      "title": "nc upload URL path parsing drops query string when path_rest is nil",
+      "description": "The path extraction uses `hostpath:match(\"^[^/]+/(.*)$\")` which captures everything after the first slash. If the URL is `http://host:8080/api/checkAsync?source=foo`, path_rest will be `api/checkAsync?source=foo` and path_query will be `/api/checkAsync?source=foo`\u2014this is correct. However, if the URL has no path component at all (e.g., `http://host:8080`), path_rest is nil and path_query becomes `/`, which would POST to the wrong endpoint. While the endpoint is always constructed with a path in main(), this is a latent fragility.",
+      "impact": "If the endpoint URL is ever constructed without a path, nc uploads go to '/' instead of the correct API path, causing 404 errors.",
+      "suggestion": "Add a guard:\n```lua\nlocal path_rest = hostpath:match(\"^[^/]+/(.*)$\") or \"\"\nlocal path_query = \"/\" .. path_rest\n```\nThis is already done but the `or \"\"` should be verified to handle the no-path case correctly.",
+      "false_positive_risk": "medium"
+    },
+    "models": [
+      "sonnet"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F11",
+      "severity": "MEDIUM",
+      "location": "sanitize_filename",
+      "title": "sanitize_filename does not handle DEL character (0x7F) correctly via %c pattern",
+      "description": "The code applies `r:gsub(\"%c\", \"_\")` to replace control characters, then separately `r:gsub(\"\\127\", \"_\")` for DEL. In Lua 5.1, `%c` in patterns matches characters for which `isctype(c, ctype_cntrl)` is true. On most C libraries this includes 0x7F (DEL), making the second gsub redundant but harmless. However, on some minimal libc implementations (uClibc, musl) `%c` may not match 0x7F. The explicit second gsub is the correct defensive approach, but the comment says 'Replace all control characters (0x00-0x1F, 0x7F)' while the first gsub comment says '0x00-0x1F'\u2014the intent is clear but the implementation order is correct (belt-and-suspenders).",
+      "impact": "Minimal; DEL in filenames is extremely rare. The double-replacement is harmless.",
+      "suggestion": "Combine into a single pattern or add a comment explaining the belt-and-suspenders approach. No functional change needed.",
+      "false_positive_risk": "high"
+    },
+    "models": [
+      "sonnet"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F12",
+      "severity": "MEDIUM",
+      "location": "send_collection_marker / JSON body construction",
+      "title": "stats_json is concatenated into JSON body without validation, allowing injection",
+      "description": "The stats_json parameter is appended directly into the JSON body: `body = body .. \",\" .. stats_json`. In main(), stats_json is constructed from integer counters via string.format, so the values are safe. However, the function signature accepts arbitrary strings, and if a caller passes a malformed or attacker-influenced stats_json, it would produce invalid or injected JSON. This is a defense-in-depth concern since all current callers are internal.",
+      "impact": "Low risk currently since stats_json is always constructed from integer counters. If the function is ever called with external data, JSON injection is possible.",
+      "suggestion": "Either document that stats_json must be a pre-validated JSON fragment, or validate that it contains only expected characters (digits, quotes, colons, braces, commas).",
+      "false_positive_risk": "medium"
+    },
+    "models": [
+      "sonnet"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F13",
+      "severity": "MEDIUM",
+      "location": "detect_upload_tool",
+      "title": "SSL + nc detection runs 'which nc' twice unnecessarily and logs misleading warning",
+      "description": "When SSL is enabled and nc is the only available tool, the function first calls `exec_ok(\"which nc ...\")` inside the nc block (skipping it with a debug log), then at the end calls `exec_ok(\"which nc ...\")` again to emit a warning. This spawns two extra shell processes. More importantly, the final warning block is only reached if `has_wget` is false (since busybox-wget would have returned true), but the condition `if config.ssl and exec_ok(\"which nc ...\")` is evaluated even when the function is about to return false\u2014the warning is correct but the double-check is wasteful on embedded systems.",
+      "impact": "Minor performance issue; two extra shell forks on embedded systems with limited process creation speed.",
+      "suggestion": "Track nc availability in a local variable:\n```lua\nlocal has_nc = exec_ok(\"which nc >/dev/null 2>&1\")\nif has_nc then\n    if config.ssl then\n        log_msg(\"debug\", \"nc skipped: does not support HTTPS\")\n    else\n        config.upload_tool = \"nc\"\n        return true\n    end\nend\n-- ...\nif config.ssl and has_nc then\n    log_msg(\"warn\", \"nc is available but cannot be used for HTTPS\")\nend\n```",
+      "false_positive_risk": "low"
+    },
+    "models": [
+      "sonnet"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F14",
+      "severity": "MEDIUM",
+      "location": "build_multipart_body / total_body calculation",
+      "title": "total_body size calculation is incorrect: preamble length counted but file bytes not streamed to variable",
+      "description": "The variable `total_body` is initialized to `#preamble` and incremented by `#chunk` for each chunk read from the source file, then incremented by `#epilogue`. This correctly computes the total byte count of the multipart body written to the temp file. The value is returned as `body_len` and used by wget's Content-Length header. However, `total_body` is computed correctly only if all chunks are read without error. If `src:read(chunk_size)` returns a partial chunk due to an I/O error mid-file, `total_body` will be less than the actual bytes written (since `out:write(chunk)` may have already written the partial data). The Content-Length will then be wrong, causing wget to send a truncated or malformed request.",
+      "impact": "On I/O errors mid-file, wget uploads will have incorrect Content-Length, causing server-side parse failures. curl uses `--data-binary @file` which determines size from the file itself, so curl is unaffected.",
+      "suggestion": "After writing the temp file, use `file_size_kb` or seek to determine the actual written size rather than computing it incrementally, or check for write errors:\n```lua\nlocal written, werr = out:write(chunk)\nif not written then\n    src:close(); out:close()\n    return nil, nil, nil\nend\n```",
+      "false_positive_risk": "medium"
+    },
+    "models": [
+      "sonnet"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F15",
+      "severity": "MEDIUM",
+      "location": "parse_proc_mounts",
+      "title": "Octal escape decoding in /proc/mounts is incomplete: only \\040, \\011, \\012, \\134 handled",
+      "description": "The /proc/mounts format encodes special characters as octal escapes (\\NNN). The code handles space (\\040), tab (\\011), newline (\\012), and backslash (\\134). However, other characters can appear in mount points, such as \\043 (#), \\073 (;), or any other byte. If a mount point contains such characters, the exclusion path will not match the actual filesystem path returned by find, and files under that mount point will not be excluded.",
+      "impact": "Files on network or special filesystems with unusual characters in their mount point paths will not be excluded, potentially causing uploads of files from network shares or special filesystems.",
+      "suggestion": "Use a general octal decoder:\n```lua\nmp = mp:gsub(\"\\\\(%d%d%d)\", function(oct)\n    return string.char(tonumber(oct, 8))\nend)\n```\nThis handles all octal escapes in a single pass.",
+      "false_positive_risk": "low"
+    },
+    "models": [
+      "sonnet"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F16",
+      "severity": "LOW",
+      "location": "log_msg / syslog path",
+      "title": "syslog logger command uses shell_quote for facility.priority but logger -p expects unquoted argument on some BusyBox versions",
+      "description": "The syslog call uses `shell_quote(config.syslog_facility .. \".\" .. prio)` which wraps the priority in single quotes. GNU logger and most implementations accept quoted arguments via the shell, but BusyBox logger on some versions passes the literal quoted string (including the quotes) as the priority, resulting in an invalid priority and the message being dropped or logged with default priority.",
+      "impact": "Syslog messages may be dropped or logged with wrong priority on BusyBox systems.",
+      "suggestion": "Since syslog_facility and prio are controlled internal values (not user input that needs quoting), use them directly after validating they contain only safe characters:\n```lua\nlocal prio_arg = config.syslog_facility .. \".\" .. prio\n-- prio_arg contains only [a-z0-9.] so no quoting needed\nos.execute(string.format(\"logger -p %s %s 2>/dev/null\",\n    prio_arg, shell_quote(\"thunderstorm-collector: \" .. clean)))\n```",
+      "false_positive_risk": "medium"
+    },
+    "models": [
+      "sonnet"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  },
+  {
+    "finding": {
+      "id": "F17",
+      "severity": "LOW",
+      "location": "main / api_endpoint scan_id append",
+      "title": "scan_id appended to api_endpoint with incorrect separator detection",
+      "description": "The code checks `if not api_endpoint:find(\"?\")` to decide whether to use '?' or '&' as the separator. `string.find` with a single-character argument treats '?' as a Lua pattern metacharacter (matches any character). This means the condition is always true (any string contains 'any character'), so '?' is always used as the separator even when the URL already has a query string (e.g., `?source=foo`), producing `?source=foo?scan_id=...` which is an invalid URL.",
+      "impact": "When a source name is set, the scan_id is appended with '?' instead of '&', producing an invalid API endpoint URL. All file uploads after the begin marker will go to a malformed URL, likely causing 400 errors from the server.",
+      "suggestion": "Use the plain=true flag for find:\n```lua\nlocal sep = \"&\"\nif not api_endpoint:find(\"?\", 1, true) then sep = \"?\" end\napi_endpoint = api_endpoint .. sep .. \"scan_id=\" .. urlencode(scan_id)\n```",
+      "false_positive_risk": "low"
+    },
+    "models": [
+      "sonnet"
+    ],
+    "n_models": 1,
+    "tiers": [
+      1
+    ],
+    "action": "fix",
+    "cluster_size": 1
+  }
+]

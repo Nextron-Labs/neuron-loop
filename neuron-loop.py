@@ -34,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 SCRIPT_DIR = Path(__file__).parent
 DEFAULT_CONFIG = SCRIPT_DIR / "config.yaml"
 OPENCLAW_MODELS = Path.home() / ".openclaw/agents/main/agent/models.json"
-VERSION = "0.2.0"
+VERSION = "0.4.0"
 
 # ─── Logging Setup ──────────────────────────────────────────
 
@@ -536,11 +536,18 @@ def similarity(fp1, fp2):
     return len(w1 & w2) / len(w1 | w2)
 
 
-def deduplicate_findings(all_findings_by_model, gate_config):
-    """Cross-reference findings across models and apply gate rules."""
+def deduplicate_findings(all_findings_by_model, gate_config, addressed_fingerprints=None):
+    """Cross-reference findings across models and apply gate rules.
+
+    addressed_fingerprints: set of fingerprints from prior iterations that were already
+    sent to the coder. Findings matching these are downgraded to 'skip' unless they
+    were explicitly marked as not fixed.
+    """
     auto_fix = gate_config.get("auto_fix_threshold", 2)
     t1_action = gate_config.get("tier1_single_action", "fix")
     t2_action = gate_config.get("tier2_single_action", "skip_unless_critical")
+    if addressed_fingerprints is None:
+        addressed_fingerprints = set()
 
     SIMILARITY_THRESHOLD = 0.35
 
@@ -593,6 +600,16 @@ def deduplicate_findings(all_findings_by_model, gate_config):
             else:
                 action = t2_action
 
+        # Check if this finding was already addressed in a prior iteration
+        cluster_fp = fingerprint_finding(finding)
+        already_addressed = any(
+            similarity(cluster_fp, afp) >= SIMILARITY_THRESHOLD
+            for afp in addressed_fingerprints
+        )
+        if already_addressed and action == "fix":
+            action = "skip"
+            finding["_skip_reason"] = "already addressed in prior iteration"
+
         triaged.append({
             "finding": finding,
             "models": models,
@@ -600,9 +617,11 @@ def deduplicate_findings(all_findings_by_model, gate_config):
             "tiers": sorted(tiers),
             "action": action,
             "cluster_size": len(cluster),
+            "fingerprint": cluster_fp,
         })
 
     # Sort: fix first, then by severity
+    sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
     triaged.sort(key=lambda t: (
         0 if t["action"] == "fix" else 1,
         sev_order.get(t["finding"]["severity"], 99),
@@ -630,10 +649,10 @@ def run_tests(test_cmd, workdir=None):
         return False, f"Test execution failed: {e}"
 
 
-# ─── Code Extraction ───────────────────────────────────────
+# ─── Code Extraction & Diff Application ────────────────────
 
 def extract_code_from_response(response, filename):
-    """Extract code blocks from coder response."""
+    """Extract code blocks from coder response (legacy full-file mode)."""
     if not response:
         return None
 
@@ -644,7 +663,6 @@ def extract_code_from_response(response, filename):
     if len(blocks) == 1:
         return blocks[0]
 
-    # Try to match by filename header
     pattern = re.compile(
         r'(?:^|\n)#+\s*' + re.escape(filename) + r'.*?\n```(?:\w+)?\n(.*?)```',
         re.DOTALL
@@ -654,6 +672,103 @@ def extract_code_from_response(response, filename):
         return m.group(1)
 
     return max(blocks, key=len)
+
+
+def parse_search_replace_blocks(response):
+    """Parse SEARCH/REPLACE blocks from coder response.
+
+    Returns list of (search_text, replace_text, finding_info) tuples.
+    """
+    if not response:
+        return []
+
+    blocks = []
+
+    # Pattern: <<<SEARCH ... >>>REPLACE ... <<<END
+    pattern = re.compile(
+        r'<<<SEARCH\s*\n(.*?)>>>REPLACE\s*\n(.*?)<<<END',
+        re.DOTALL
+    )
+
+    for m in pattern.finditer(response):
+        search = m.group(1)
+        replace = m.group(2)
+
+        # Strip trailing newline (the block delimiter adds one)
+        if search.endswith('\n'):
+            search = search[:-1]
+        if replace.endswith('\n'):
+            replace = replace[:-1]
+
+        # Find the associated finding header (look backwards for ### Finding N)
+        preceding = response[:m.start()]
+        finding_match = re.search(r'###\s*Finding\s*(\d+)\s*:\s*(\w+)', preceding[::-1][:500][::-1])
+        finding_info = finding_match.group(0) if finding_match else "unknown"
+
+        blocks.append((search, replace, finding_info))
+
+    return blocks
+
+
+def sanitize_replacement(text):
+    """Strip stray SEARCH/REPLACE format markers from replacement text.
+    These can leak when the coder echoes its own format into code."""
+    markers = ['<<<SEARCH', '>>>REPLACE', '<<<END']
+    for marker in markers:
+        text = text.replace(marker, '')
+    return text
+
+
+def apply_search_replace(content, blocks, logger):
+    """Apply SEARCH/REPLACE blocks to file content.
+
+    Returns (new_content, applied_count, failed_count).
+    """
+    applied = 0
+    failed = 0
+
+    for search, replace, info in blocks:
+        replace = sanitize_replacement(replace)
+        if search in content:
+            content = content.replace(search, replace, 1)
+            applied += 1
+            logger.info(f"  Applied: {info}")
+        else:
+            # Try with whitespace normalization
+            search_normalized = re.sub(r'[ \t]+', ' ', search)
+            content_normalized = re.sub(r'[ \t]+', ' ', content)
+            if search_normalized in content_normalized:
+                # Find the actual position and replace
+                idx = content_normalized.index(search_normalized)
+                # Count newlines to find line range
+                line_start = content[:idx].count('\n')
+                line_end = line_start + search.count('\n')
+                logger.warn(f"  Fuzzy match for {info} (lines {line_start}-{line_end})")
+
+                # Do the replacement on original content using line-based matching
+                orig_lines = content.split('\n')
+                search_lines = search.split('\n')
+                replace_lines = replace.split('\n')
+
+                # Find matching line range
+                found = False
+                for i in range(len(orig_lines) - len(search_lines) + 1):
+                    chunk = orig_lines[i:i + len(search_lines)]
+                    if all(a.strip() == b.strip() for a, b in zip(chunk, search_lines)):
+                        orig_lines[i:i + len(search_lines)] = replace_lines
+                        content = '\n'.join(orig_lines)
+                        applied += 1
+                        found = True
+                        break
+
+                if not found:
+                    failed += 1
+                    logger.warn(f"  FAILED to apply: {info} (fuzzy match failed)")
+            else:
+                failed += 1
+                logger.warn(f"  FAILED to apply: {info} (search text not found)")
+
+    return content, applied, failed
 
 
 # ─── Report Generation ─────────────────────────────────────
@@ -835,6 +950,12 @@ def main():
     # Track per-model stats across iterations
     model_stats = {}  # label → {"total_findings": N, "api_calls": N, "errors": N}
 
+    # Track findings that were already sent to the coder (cross-iteration dedup)
+    addressed_fingerprints = set()
+
+    # Track last known good state for revert-on-test-failure
+    last_good_files = {name: content for name, content in files_content.items()}
+
     iteration = 0
     for iteration in range(1, max_iter + 1):
         elapsed = time.time() - start_time
@@ -920,7 +1041,7 @@ def main():
 
         # ── Step 3: Triage ──
         logger.info("Triaging findings...")
-        triaged = deduplicate_findings(review_results, config["gate"])
+        triaged = deduplicate_findings(review_results, config["gate"], addressed_fingerprints)
         storage.save_triage(iteration, triaged)
 
         fix_items = [t for t in triaged if t["action"] == "fix"]
@@ -929,7 +1050,9 @@ def main():
         logger.event("triage_complete", iteration=iteration,
                      total_unique=len(triaged), fix=len(fix_items), skip=len(skip_items))
 
-        print(f"\n   ⚖️  Triage: {len(fix_items)} fix, {len(skip_items)} skip")
+        reused = sum(1 for t in skip_items if t["finding"].get("_skip_reason"))
+        print(f"\n   ⚖️  Triage: {len(fix_items)} fix, {len(skip_items)} skip"
+              f"{f' ({reused} already addressed)' if reused else ''}")
         for t in fix_items:
             f = t["finding"]
             models_str = ", ".join(t["models"])
@@ -958,59 +1081,109 @@ def main():
         findings_text = ""
         for i, t in enumerate(fix_items, 1):
             f = t["finding"]
-            findings_text += f"\n### {i}. [{f['severity']}] {f['title']}\n"
+            findings_text += f"\n### Finding {i}. [{f['severity']}] {f['title']}\n"
             findings_text += f"Location: {f.get('location', '?')}\n"
             findings_text += f"Description: {f.get('description', '')}\n"
             if f.get("suggestion"):
                 findings_text += f"Suggested fix: {f['suggestion']}\n"
+            # Track this finding as addressed for cross-iteration dedup
+            if t.get("fingerprint"):
+                addressed_fingerprints.add(t["fingerprint"])
 
         fix_prompt = build_fix_prompt(files_content, findings_text, task_context)
         storage.save_fix_request(iteration, fix_prompt)
 
         fix_messages = [
-            {"role": "system", "content": "You are a senior engineer. Fix the reported issues. "
-             "Return the complete fixed file(s) in fenced code blocks."},
+            {"role": "system", "content": "You are a senior engineer. Fix the reported issues using "
+             "SEARCH/REPLACE blocks. Do NOT return the entire file — only the changed sections. "
+             "Use <<<SEARCH, >>>REPLACE, <<<END delimiters."},
             {"role": "user", "content": fix_prompt},
         ]
 
         try:
             fix_response, fix_usage = client.call(
-                coder_provider, coder_model, fix_messages, max_tokens=16384, timeout=600
+                coder_provider, coder_model, fix_messages, max_tokens=8192, timeout=600
             )
             storage.save_fix_response(iteration, fix_response)
 
             logger.event("coder_complete", iteration=iteration,
                          provider=coder_provider, model=coder_model, usage=fix_usage)
 
-            # Extract and apply fixed code
-            files_updated = False
-            for filename in list(files_content.keys()):
-                new_code = extract_code_from_response(fix_response, filename)
-                if new_code and len(new_code.strip()) > 100:
-                    old_len = len(files_content[filename])
-                    new_len = len(new_code)
-                    if new_len >= old_len * 0.5:
-                        files_content[filename] = new_code
+            # Parse SEARCH/REPLACE blocks
+            blocks = parse_search_replace_blocks(fix_response)
+
+            if blocks:
+                logger.info(f"Parsed {len(blocks)} SEARCH/REPLACE blocks")
+
+                files_updated = False
+                for filename in list(files_content.keys()):
+                    old_content = files_content[filename]
+                    new_content, applied, failed = apply_search_replace(
+                        old_content, blocks, logger
+                    )
+
+                    if applied > 0:
+                        files_content[filename] = new_content
                         files_updated = True
 
                         # Save to storage and write back to disk
-                        storage.save_iteration_file(iteration, filename, new_code)
+                        storage.save_iteration_file(iteration, filename, new_content)
                         for fp in args.files:
                             if Path(fp).name == filename:
-                                Path(fp).write_text(new_code)
+                                Path(fp).write_text(new_content)
                                 break
 
-                        logger.info(f"Updated {filename} ({old_len} → {new_len} chars)")
+                        logger.info(f"Updated {filename}: {applied} applied, {failed} failed "
+                                    f"({len(old_content)} → {len(new_content)} chars)")
                         logger.event("file_updated", iteration=iteration, filename=filename,
-                                     old_size=old_len, new_size=new_len)
+                                     old_size=len(old_content), new_size=len(new_content),
+                                     patches_applied=applied, patches_failed=failed)
                     else:
-                        logger.warn(f"{filename}: new code too short ({new_len} vs {old_len})")
-                else:
-                    logger.warn(f"Could not extract fixed code for {filename}")
+                        logger.warn(f"No patches applied to {filename} ({failed} failed)")
 
-            if not files_updated:
-                logger.warn("No files updated, breaking loop")
-                break
+                if not files_updated:
+                    # Fallback: try legacy full-file extraction
+                    logger.info("No SEARCH/REPLACE blocks applied, trying full-file fallback...")
+                    for filename in list(files_content.keys()):
+                        new_code = extract_code_from_response(fix_response, filename)
+                        if new_code and len(new_code.strip()) > 100:
+                            old_len = len(files_content[filename])
+                            new_len = len(new_code)
+                            if new_len >= old_len * 0.5:
+                                files_content[filename] = new_code
+                                files_updated = True
+                                storage.save_iteration_file(iteration, filename, new_code)
+                                for fp in args.files:
+                                    if Path(fp).name == filename:
+                                        Path(fp).write_text(new_code)
+                                        break
+                                logger.info(f"Fallback: updated {filename} ({old_len} → {new_len})")
+
+                    if not files_updated:
+                        logger.warn("No files updated, breaking loop")
+                        break
+            else:
+                # No SEARCH/REPLACE blocks found — try legacy extraction
+                logger.info("No SEARCH/REPLACE blocks found, trying full-file extraction...")
+                files_updated = False
+                for filename in list(files_content.keys()):
+                    new_code = extract_code_from_response(fix_response, filename)
+                    if new_code and len(new_code.strip()) > 100:
+                        old_len = len(files_content[filename])
+                        new_len = len(new_code)
+                        if new_len >= old_len * 0.5:
+                            files_content[filename] = new_code
+                            files_updated = True
+                            storage.save_iteration_file(iteration, filename, new_code)
+                            for fp in args.files:
+                                if Path(fp).name == filename:
+                                    Path(fp).write_text(new_code)
+                                    break
+                            logger.info(f"Updated {filename} ({old_len} → {new_len} chars)")
+
+                if not files_updated:
+                    logger.warn("No files updated, breaking loop")
+                    break
 
             # ── Step 7: Post-fix tests ──
             if test_cmd and config["test"]["after_fix"]:
@@ -1020,9 +1193,23 @@ def main():
                 logger.event("test_run", iteration=iteration, phase="post", passed=test_ok)
                 if test_ok:
                     print("   ✅ Post-fix tests pass")
+                    # Update last known good state
+                    last_good_files = {name: content for name, content in files_content.items()}
+                    logger.info("Snapshot saved as last known good state")
                 else:
-                    print(f"   ❌ Post-fix tests failed")
-                    logger.warn("Tests failed after fix", test_output=test_out[:500])
+                    print(f"   ❌ Post-fix tests failed — reverting to last good version")
+                    logger.warn("Tests failed after fix, reverting to last good state",
+                                test_output=test_out[:500])
+
+                    # Revert files to last known good state
+                    files_content = {name: content for name, content in last_good_files.items()}
+                    for filename, content in files_content.items():
+                        for fp in args.files:
+                            if Path(fp).name == filename:
+                                Path(fp).write_text(content)
+                                break
+                    storage.save_iteration_file(iteration, "REVERTED", "Reverted to last good state")
+                    logger.event("revert", iteration=iteration, reason="post-fix tests failed")
 
         except Exception as e:
             logger.error(f"Coder failed: {e}")

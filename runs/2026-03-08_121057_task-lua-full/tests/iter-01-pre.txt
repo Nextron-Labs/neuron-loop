@@ -1,0 +1,61 @@
+# Result: PASS
+
+=== TEST 1: Lua 5.1 syntax check ===
+  ✅ PASS: Syntax valid
+
+=== TEST 2: Help flag (-h) ===
+  ✅ PASS: Help text contains 15/15 expected flags
+
+=== TEST 3: Banner output (dry-run mode) ===
+  ✅ PASS: Banner contains Thunderstorm
+  ✅ PASS: Banner shows version
+
+=== TEST 4: Unknown flag error ===
+  ✅ PASS: Unknown flag produces error message
+  ✅ PASS: Non-zero exit code on unknown flag
+
+=== TEST 5: Dry-run mode ===
+  ✅ PASS: Dry-run mode acknowledged
+  ✅ PASS: Files discovered in dry-run
+
+=== TEST 6: File size filtering ===
+  ✅ PASS: Large file filtered out
+
+=== TEST 7: Integration test (stub server upload) ===
+  ✅ PASS: Stub server running on port 18080
+  Collector output:
+    ==============================================================
+        ________                __            __
+       /_  __/ /  __ _____  ___/ /__ _______ / /____  ______ _
+        / / / _ \/ // / _ \/ _  / -_) __(_-</ __/ _ \/ __/  ' \
+       /_/ /_//_/\_,_/_//_/\_,_/\__/_/ /___/\__/\___/_/ /_/_/_/
+       v0.1.0 (Lua 5.1+ edition)
+    
+       THOR Thunderstorm Collector for Linux/Unix
+    ==============================================================
+    [info] Upload tool: nc
+    [info] Started Thunderstorm Collector (Lua) - Version 0.1.0
+    [info] Server: 127.0.0.1
+    [info] Port: 18080
+    [info] API endpoint: http://127.0.0.1:18080/api/checkAsync?source=test-lua-collector
+    [info] Max age (days): 14
+    [info] Max size (KB): 2000
+    [info] Source: test-lua-collector
+    [info] Folders: /testfiles
+    [info] Scanning '/testfiles'
+    [debug] find command: find '/testfiles' -path '/proc' -prune -o -path '/sys' -prune -o -path '/dev' -prune -o -path '/run' -prune -o -path '/snap' -prune -o -path '/.snapshots' -prune -o -path '/sys' -prune -o -path '/sys/kernel/security' -prune -o -path '/sys/fs/cgroup' -prune -o -path '/sys/fs/pstore' -prune -o -path '/sys/firmware/efi/efivars' -prune -o -path '/sys/fs/bpf' -prune -o -path '/sys/kernel/config' -prune -o -path '/sys/fs/selinux' -prune -o -path '/sys/kernel/tracing' -prune -o -path '/sys/kernel/debug' -prune -o -path '/sys/fs/fuse/connections' -prune -o -path '/proc' -prune -o -path '/dev/pts' -prune -o -path '/dev/mqueue' -prune -o -path '/sys/fs/cgroup' -prune -o -path '/dev/null' -prune -o -path '/dev/zero' -prune -o -path '/dev/full' -prune -o -path '/dev/tty' -prune -o -path '/dev/random' -prune -o -path '/dev/urandom' -prune -o -path '/proc/kcore' -prune -o -path '/proc/keys' -prune -o -path '/proc/latency_stats' -prune -o -path '/proc/timer_list' -prune -o -path '/proc/interrupts' -prune -o -path '/proc/asound' -prune -o -path '/proc/bus' -prune -o -path '/proc/fs' -prune -o -path '/proc/irq' -prune -o -path '/proc/sys' -prune -o -path '/proc/sysrq-trigger' -prune -o -type f -mtime -14 -print 2>/dev/null
+    [debug] Submitting '/testfiles/nullfile.bin'
+    [debug] Submitting '/testfiles/sample.exe'
+    [debug] Submitting '/testfiles/hello.txt'
+    [info] Run completed: scanned=3 submitted=3 skipped=0 failed=0 seconds=0
+    Run completed: scanned=3 submitted=3 skipped=0 failed=0 seconds=0
+  ✅ PASS: Files uploaded to stub server (3 files persisted)
+  ✅ PASS: Summary line present
+  ✅ PASS: Source parameter received by server
+
+=== TEST 8: Lua 5.1 keyword compatibility ===
+  ✅ PASS: No Lua 5.1 incompatible keywords found
+
+========================================
+  RESULTS: 14 passed, 0 failed, 8 tests
+========================================

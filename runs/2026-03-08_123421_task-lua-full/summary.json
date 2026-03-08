@@ -1,0 +1,29 @@
+{
+  "version": "0.3.0",
+  "task": "task-lua-full.md",
+  "files": [
+    "thunderstorm-collector.lua"
+  ],
+  "iterations": 5,
+  "elapsed_seconds": 1317.2,
+  "model_stats": {
+    "sonnet": {
+      "total_findings": 90,
+      "api_calls": 5,
+      "errors": 0,
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6",
+      "tier": 1
+    },
+    "gpt54": {
+      "total_findings": 34,
+      "api_calls": 5,
+      "errors": 0,
+      "provider": "openai",
+      "model": "gpt-5.4",
+      "tier": 1
+    }
+  },
+  "run_dir": "runs/2026-03-08_123421_task-lua-full",
+  "completed_at": "2026-03-08T11:56:19.159672+00:00"
+}

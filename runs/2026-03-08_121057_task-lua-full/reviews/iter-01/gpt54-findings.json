@@ -1,0 +1,82 @@
+[
+  {
+    "id": "F1",
+    "severity": "HIGH",
+    "location": "die / function body; parse_args unknown-option branch; main exit path",
+    "title": "Exit codes do not follow the documented collector contract",
+    "description": "The script exits with `os.exit(1)` for fatal errors in `die()`, and also uses `os.exit(1)` for unknown CLI options. On successful completion it implicitly exits 0 even when some files failed to upload. The stated hardened behavior for the other collectors is `0=clean, 1=partial failure, 2=fatal error`, but this Lua collector does not implement that contract.",
+    "impact": "Automation cannot reliably distinguish a fatal startup/configuration failure from a partial collection run. A run with failed uploads will incorrectly appear successful, which can hide collection gaps in production.",
+    "suggestion": "Introduce explicit final exit status handling: use `os.exit(2)` for fatal errors in `die()` and argument/validation failures; after the scan, exit `1` if `counters.files_failed > 0`, otherwise `0`. Example: `local code = (counters.files_failed > 0) and 1 or 0; cleanup_temp_files(); if log_file_handle then log_file_handle:close() end; os.exit(code)`.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F2",
+    "severity": "HIGH",
+    "location": "main / begin marker send block",
+    "title": "Missing required begin-marker retry on initial failure",
+    "description": "The script sends the `begin` collection marker exactly once via `send_collection_marker(base_url, \"begin\", nil, nil)`. If that initial request fails transiently, no retry is attempted, despite the documented hardening requirement of a single retry after 2 seconds on initial failure.",
+    "impact": "Transient network issues at startup can cause the collection session to be untracked server-side, breaking correlation via `scan_id` and reducing observability of the run.",
+    "suggestion": "If the first begin marker returns an empty `scan_id`, sleep 2 seconds and retry once before proceeding. Example: `scan_id = send_collection_marker(...); if scan_id == \"\" then os.execute(\"sleep 2\"); scan_id = send_collection_marker(...) end`.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F3",
+    "severity": "HIGH",
+    "location": "CLI parsing/help + upload_with_curl + upload_with_wget + send_collection_marker",
+    "title": "Custom CA bundle support (`--ca-cert`) is missing",
+    "description": "The hardened requirements explicitly include `--ca-cert PATH` for TLS validation with custom CA bundles, but the Lua collector neither parses this option nor passes a CA bundle to curl/wget. It only supports `--ssl` and `--insecure`.",
+    "impact": "On embedded systems with incomplete trust stores, operators cannot securely validate a private/internal Thunderstorm server certificate. They may be forced to use `--insecure`, weakening transport security.",
+    "suggestion": "Add `config.ca_cert`, parse `--ca-cert <path>`, validate the file exists, and pass it to backends (`curl --cacert <path>`, `wget --ca-certificate=<path>` where supported). Reject incompatible combinations only where necessary.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F4",
+    "severity": "HIGH",
+    "location": "main / collection lifecycle; entire script",
+    "title": "No interruption handling or documented wrapper strategy for SIGINT/SIGTERM",
+    "description": "The requirements call out signal handling parity via a shell-wrapper approach because Lua 5.1 lacks native signal handling on these targets. This script has neither in-process handling nor any documented/implemented wrapper mechanism to send an `interrupted` collection marker with stats on SIGINT/SIGTERM.",
+    "impact": "If the collector is terminated during a long scan, the server never receives an interruption marker and the run may appear incomplete or hung. Operational tooling loses accurate end-state reporting.",
+    "suggestion": "Implement the documented shell-wrapper approach: have a small POSIX shell launcher trap `INT`/`TERM`, invoke the Lua collector in a way that persists state/stats, and send an `interrupted` marker before exit. If that is intentionally unsupported, document the limitation explicitly in the script/help and release notes.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F5",
+    "severity": "HIGH",
+    "location": "build_multipart_body / full function; upload_with_wget; upload_with_nc; upload_with_busybox_wget",
+    "title": "Multipart body construction reads entire file into memory and duplicates it",
+    "description": "For wget/nc uploads, `build_multipart_body()` reads the whole sample with `f:read(\"*a\")`, concatenates it into a Lua table, then `table.concat`s the full multipart body, and finally writes that body to a temp file. This creates multiple in-memory copies of the sample plus headers. On 2\u201316 MB embedded devices, a file near the 2000 KB limit can consume several megabytes transiently.",
+    "impact": "Large but allowed samples can trigger memory pressure, Lua allocation failures, or process termination on constrained devices, causing missed uploads or collector crashes.",
+    "suggestion": "Stream multipart construction directly to the temp file instead of materializing the whole body in memory. Write headers, then copy the source file in chunks (e.g. 8\u201332 KB), then write the closing boundary. Compute `Content-Length` from file size plus header/footer lengths if needed.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F6",
+    "severity": "MEDIUM",
+    "location": "mktemp / function body",
+    "title": "Use of `os.tmpname()` is unsafe/unreliable on embedded Unix targets",
+    "description": "`mktemp()` relies on `os.tmpname()` and then opens the returned path. On Unix-like systems this is prone to race conditions because the name generation and file creation are separate operations. On some minimal environments `os.tmpname()` may also return unusable paths or fail unexpectedly.",
+    "impact": "An attacker on the same system could potentially pre-create or replace temp paths, and reliability suffers on BusyBox/OpenWrt variants where temp-name behavior is inconsistent.",
+    "suggestion": "Prefer invoking a shell `mktemp` utility when available (`mktemp /tmp/thunderstorm.XXXXXX`) and fall back carefully only if absent. If keeping a Lua fallback, create files under a fixed writable temp dir with randomized names and retry on collision.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F7",
+    "severity": "MEDIUM",
+    "location": "send_collection_marker / curl and wget command construction",
+    "title": "Collection marker requests ignore command success and can silently fail",
+    "description": "Both curl and wget branches in `send_collection_marker()` call `os.execute(cmd)` but do not check whether the command succeeded. The function then attempts to parse `resp_file` if present and otherwise returns an empty string. This suppresses transport failures and makes begin/end marker delivery failures indistinguishable from a valid empty response.",
+    "impact": "Operational visibility is reduced: marker delivery problems are silent, begin marker retry logic cannot be implemented correctly without reliable failure detection, and end/interrupted markers may be lost without any log signal.",
+    "suggestion": "Use `exec_ok(cmd)` and log failures to stderr/log file. Return a success flag plus optional `scan_id`, e.g. `return false, \"\"` on transport failure and `return true, id or \"\"` on HTTP success.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F8",
+    "severity": "MEDIUM",
+    "location": "main / banner and summary output",
+    "title": "Unconditional stdout output breaks quiet/non-interactive behavior parity",
+    "description": "The script always prints the ASCII banner and final summary to stdout, even when `--quiet` is set. The hardened behavior described for the other collectors includes TTY-aware progress control and routing errors to stderr; this collector still emits normal-status output unconditionally to stdout.",
+    "impact": "Machine consumers expecting silent operation or parsing stdout may be disrupted. In cron/automation contexts this creates noisy output and inconsistent behavior relative to the other collectors.",
+    "suggestion": "Suppress banner/summary unless stdout is a TTY and quiet mode is off, or add explicit `--progress/--no-progress` parity and gate human-oriented output behind it. Keep errors on stderr.",
+    "false_positive_risk": "low"
+  }
+]

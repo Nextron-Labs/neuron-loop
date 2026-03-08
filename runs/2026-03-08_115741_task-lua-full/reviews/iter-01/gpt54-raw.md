@@ -1,0 +1,82 @@
+[
+  {
+    "id": "F1",
+    "severity": "HIGH",
+    "location": "die / main / parse_args / process exit handling",
+    "title": "Exit codes do not follow the documented collector contract",
+    "description": "The script exits with status 1 for fatal configuration/runtime errors via die(), and otherwise falls off the end of main() with exit status 0 even when some file uploads failed. The hardened collectors are expected to use 0=clean, 1=partial failure, 2=fatal error. This implementation currently cannot distinguish partial upload failures from a clean run, and fatal errors are reported with the wrong code.",
+    "impact": "Supervisors, wrappers, and automation cannot reliably detect whether the run was clean, partially failed, or fatally failed. In production this can hide upload failures and break parity with the other collector implementations.",
+    "suggestion": "Introduce a final exit-status computation and use 2 for fatal errors. For example: make die() call os.exit(2), and at the end of main() call os.exit(counters.files_failed > 0 and 1 or 0). Also ensure unknown-option/config-validation fatal paths use die() or os.exit(2).",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F2",
+    "severity": "HIGH",
+    "location": "main / send_collection_marker begin flow",
+    "title": "Begin collection marker is not retried on initial failure",
+    "description": "The script sends the begin marker exactly once: `scan_id = send_collection_marker(base_url, \"begin\", nil, nil)`. The hardening requirements explicitly call for a single retry after 2 seconds on initial failure. If the first marker request fails transiently, the run proceeds without a scan_id and without retrying.",
+    "impact": "Transient network/server issues at startup can cause the entire collection session to be uncorrelated on the server side, reducing traceability and breaking parity with the hardened collectors.",
+    "suggestion": "If the first begin marker call returns an empty scan_id, sleep 2 seconds and retry once before proceeding. Log both attempts. Example: call send_collection_marker() again after `os.execute(\"sleep 2\")` when the first result is empty.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F3",
+    "severity": "HIGH",
+    "location": "CLI parsing / upload_with_curl / upload_with_wget / send_collection_marker",
+    "title": "Custom CA bundle support is missing despite required hardening parity",
+    "description": "The script supports `--ssl` and `--insecure` but does not implement the required `--ca-cert PATH` option. As a result, users on embedded systems with private PKI or custom trust stores cannot validate TLS using a supplied CA bundle. The only workaround is `--insecure`, which disables verification entirely.",
+    "impact": "Deployments using internal CAs cannot securely use HTTPS. Operators may be forced to disable certificate validation, weakening transport security and violating the stated hardening baseline.",
+    "suggestion": "Add `config.ca_cert`, parse `--ca-cert <path>`, validate the file exists, and pass it through to the selected backend: curl `--cacert`, wget `--ca-certificate`, and marker requests as well. If using nc, reject HTTPS when a CA bundle is required because nc cannot validate TLS.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F4",
+    "severity": "HIGH",
+    "location": "upload_with_nc / detect_upload_tool",
+    "title": "Netcat backend cannot perform HTTPS uploads but is still selected for SSL mode",
+    "description": "When curl and wget are unavailable, detect_upload_tool() selects `nc` even if `config.ssl` is true, only logging a warning. However, upload_with_nc() always emits a plain HTTP request over a raw TCP socket and never performs a TLS handshake. For `https://...` endpoints this will fail or send invalid traffic to the server.",
+    "impact": "On minimal systems using `--ssl`, the collector may appear configured for secure transport but all uploads and collection markers will fail when nc is the chosen backend. This is a real reliability issue on embedded targets where nc may be the only available tool.",
+    "suggestion": "Do not select nc when `config.ssl` is true unless an actual TLS-capable wrapper is available. Treat this as a fatal capability mismatch: `if config.ssl and only nc is available then die(\"HTTPS requires curl or wget; nc cannot upload over TLS\")`.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F5",
+    "severity": "MEDIUM",
+    "location": "send_collection_marker / tool selection for markers",
+    "title": "Collection markers are never sent when nc is the detected upload tool",
+    "description": "send_collection_marker() only implements curl and wget/busybox-wget branches. If detect_upload_tool() selected `nc`, `tool` remains `nc`, no request is sent, and the function silently returns an empty scan_id. This means begin/end markers are skipped entirely on nc-only systems.",
+    "impact": "Runs on nc-only devices lose begin/end collection telemetry and scan correlation, even though file uploads may proceed via nc. This creates inconsistent server-side behavior across environments.",
+    "suggestion": "Either implement JSON POST via nc for plain HTTP, or explicitly log that markers are unsupported with nc and treat missing marker support as a degraded/partial-failure condition. If SSL is enabled, fail earlier as noted in F4.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F6",
+    "severity": "MEDIUM",
+    "location": "main / signal handling parity gap",
+    "title": "Required interruption marker handling is absent and not documented as a limitation",
+    "description": "The hardened collectors are expected to send an `interrupted` collection marker with stats on SIGINT/SIGTERM. This Lua implementation has no such handling, and although the prompt notes native signal handling is unavailable on minimal Lua 5.1, the script neither provides a shell-wrapper approach nor clearly documents the limitation in behavior.",
+    "impact": "If the collector is terminated mid-run, the server receives no interruption marker and the run may appear incomplete or hung. This is especially relevant on embedded devices managed by watchdogs or service supervisors.",
+    "suggestion": "Because pure Lua 5.1 cannot reliably trap signals on the target, document this limitation explicitly and provide a companion shell wrapper that traps INT/TERM and invokes marker submission before terminating the Lua process, or at minimum update help/comments to state interruption markers are unsupported in pure Lua mode.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F7",
+    "severity": "MEDIUM",
+    "location": "CLI / user interface parity",
+    "title": "Progress reporting and TTY auto-detection are missing",
+    "description": "The hardening baseline includes progress reporting with TTY auto-detection and `--progress` / `--no-progress`. This script has neither the CLI options nor any progress behavior. While not a security issue, it is a stated parity requirement for the collector family.",
+    "impact": "Operational UX is inconsistent with the other collectors, and users on interactive sessions lose visibility into long-running scans on large directory trees.",
+    "suggestion": "Add `config.progress` with auto-detection based on whether stdout/stderr is a TTY, implement `--progress` and `--no-progress`, and emit lightweight periodic progress updates without excessive memory use.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F8",
+    "severity": "MEDIUM",
+    "location": "build_multipart_body / upload_with_wget / upload_with_nc",
+    "title": "Multipart body construction reads entire file into memory",
+    "description": "build_multipart_body() reads the full sample into a Lua string (`content = f:read(\"*a\")`) and then concatenates it into another full multipart body string before writing to a temp file. For files near the 2000 KB limit this can transiently consume multiple megabytes per upload, which is significant on the stated 2–16 MB RAM targets.",
+    "impact": "On low-memory embedded devices, uploads can trigger memory pressure, allocation failures, or process termination, especially when Lua's string allocation overhead and garbage collection are considered.",
+    "suggestion": "Stream the multipart body directly to the temp file instead of materializing both the file content and full body in memory. Write the headers, then copy the file in chunks (e.g. 8–32 KB), then write the trailer. Compute Content-Length from file size plus header/trailer lengths.",
+    "false_positive_risk": "low"
+  }
+]

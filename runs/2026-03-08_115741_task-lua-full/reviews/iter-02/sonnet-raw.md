@@ -1,0 +1,204 @@
+```json
+[
+  {
+    "id": "F1",
+    "severity": "CRITICAL",
+    "location": "upload_with_curl / build around line 330-355",
+    "title": "Shell injection via filepath in curl -F argument",
+    "description": "In upload_with_curl, the form field is constructed as `shell_quote(\"file=@\" .. filepath)`. shell_quote wraps the entire string in single quotes, but the value passed to curl's -F option is `file=@/path/to/file`. curl itself parses the -F value and interprets semicolons as field separators (e.g., `file=@/tmp/foo;type=text/html` changes the Content-Type). If filepath contains a semicolon, curl will interpret the part after it as additional form-data parameters. While shell injection is prevented by shell_quote, curl's own -F parser can be exploited by a malicious filename containing `;type=` or `;filename=` sequences. The comment in the code says 'Use separate -F fields to avoid semicolon injection' but the filepath itself is still embedded in the -F value and is not sanitized for curl's internal parser.",
+    "impact": "A file named `/tmp/evil;type=text/html` would cause curl to send Content-Type: text/html instead of application/octet-stream, potentially bypassing server-side content-type checks. More critically, `;filename=../../etc/passwd` could manipulate the filename seen by the server.",
+    "suggestion": "Use `--form-string` for the filename field and `--form` only for the file reference, or sanitize filepath to remove semicolons before embedding in -F. Better: use `curl -F 'file=@-' --data-binary @filepath` with a separate filename header, or pass the filepath via an environment variable and use a wrapper. At minimum, strip or reject filenames containing semicolons before constructing the curl command.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F2",
+    "severity": "CRITICAL",
+    "location": "build_multipart_body / lines ~290-325",
+    "title": "Multipart boundary not verified against file content — potential boundary collision",
+    "description": "The multipart boundary is generated as `ThunderstormBoundary<time><rand1><rand2>`. The boundary is never checked against the actual file content. If a binary file happens to contain the exact boundary string (e.g., `--ThunderstormBoundary...`), the server's MIME parser will split the body at that point, corrupting the upload and potentially causing the server to parse attacker-controlled file content as form metadata. math.random with os.time() seed is not cryptographically random and on embedded systems with low-resolution clocks, the same boundary may be generated repeatedly.",
+    "impact": "Malicious files crafted to contain the boundary string will be parsed incorrectly by the server. On systems where os.time() has second-level resolution and math.random is a simple LCG, the boundary space is small enough to be predictable.",
+    "suggestion": "After generating the boundary, scan the file content (or at least the first/last few KB) for the boundary string and regenerate if found. Alternatively, use a longer random boundary (e.g., 32 hex chars from /dev/urandom: `head -c 16 /dev/urandom | od -A n -t x1 | tr -d ' \\n'`).",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F3",
+    "severity": "CRITICAL",
+    "location": "sanitize_filename / line ~115",
+    "title": "Incomplete sanitization — NUL bytes and other control characters not removed from filename",
+    "description": "sanitize_filename replaces `%z` (NUL byte in Lua patterns) along with `\"`, `\\`, and `;`. However, it does not remove other control characters (0x01-0x1F except \\r and \\n which are handled separately). More importantly, the `%z` in the character class `[\"\\\\;%z]` is a Lua pattern class for NUL, but inside `[]` in Lua patterns, `%z` matches the NUL character correctly only in some implementations. The real issue is that HTTP headers (Content-Disposition) containing control characters other than the sanitized ones can cause header injection. A filename like `foo\\x0Abar` with a literal newline would inject a new HTTP header line.",
+    "impact": "Filenames with embedded newlines (0x0A) or carriage returns (0x0D) that slip through could inject arbitrary HTTP headers into the multipart body, potentially manipulating the server's parser.",
+    "suggestion": "Replace all bytes < 0x20 and 0x7F with underscores: `r = s:gsub('[%c]', '_')`. Also consider percent-encoding the filename in the Content-Disposition header instead of sanitizing.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F4",
+    "severity": "HIGH",
+    "location": "upload_with_nc / lines ~390-430",
+    "title": "nc upload uses body_len from build_multipart_body but body is re-streamed — length mismatch if file changes",
+    "description": "build_multipart_body computes body_len as `#header + fsize + #footer` where fsize is obtained by seeking to end of file. The actual body is then written to a temp file. In upload_with_nc, the Content-Length header uses body_len from build_multipart_body. However, the nc path re-reads the body_file (the temp file written by build_multipart_body) and appends it to the request. If the file was modified between the size measurement and the actual read (TOCTOU), or if the write to the temp file failed partially, the Content-Length will be wrong. Additionally, the nc path in upload_with_nc does NOT use body_len at all — it reads from body_file but the Content-Length in the HTTP request is set to body_len which was computed before the temp file was written. The actual temp file size should be used.",
+    "impact": "Wrong Content-Length causes the server to either truncate the body or wait for more data, resulting in failed uploads or hung connections.",
+    "suggestion": "After writing the temp file in build_multipart_body, verify its actual size matches body_len. In upload_with_nc, use file_size_bytes(body_file) for the Content-Length rather than the pre-computed body_len.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F5",
+    "severity": "HIGH",
+    "location": "send_collection_marker / nc branch, lines ~490-515",
+    "title": "Content-Length in nc marker request uses #body (Lua string length) which is correct for UTF-8 but the body is written to a file and re-read — inconsistency with file path",
+    "description": "In the nc branch of send_collection_marker, the HTTP request is built with `Content-Length: #body` and then `req_f:write(body)` writes the body inline. This is actually correct for the marker case (body is a Lua string). However, the body was already written to body_file earlier, and the nc branch ignores body_file entirely — it re-embeds the body string directly in the request file. This means the body_file temp file is created but never used in the nc path, wasting a temp file slot. More importantly, if body contains multi-byte UTF-8 sequences, `#body` in Lua gives byte length (correct for HTTP), so this is fine. But the inconsistency with the file-based approach is a maintenance hazard.",
+    "impact": "Minor resource waste (unused temp file). No functional bug in the current code, but the inconsistency could lead to bugs if the code is modified.",
+    "suggestion": "In the nc branch of send_collection_marker, either use body_file consistently (read it and stream it) or document that body_file is only used by curl/wget branches and skip creating it for nc.",
+    "false_positive_risk": "medium"
+  },
+  {
+    "id": "F6",
+    "severity": "HIGH",
+    "location": "build_find_command / lines ~540-560",
+    "title": "find prune logic is incorrect — files in excluded directories will still be printed",
+    "description": "The find command is constructed as: `find DIR \\( -path P1 -prune -o -path P2 -prune \\) -o -type f -mtime -N -print`. The issue is operator precedence: `-prune` has no `-print` action, so when a pruned directory is encountered, find evaluates the entire expression. The correct POSIX idiom requires `\\( PRUNE_EXPR \\) -o \\( -type f -mtime -N -print \\)`. In the current code, the structure is `\\( prune1 -o prune2 \\) -o -type f -mtime -N -print`. When a path matches a prune clause, `-prune` returns true and the `-o` short-circuits, so the `-type f -print` is NOT evaluated for that path — this part is correct. However, the outer `-o` means: if the prune group is false (path doesn't match any exclude), then evaluate `-type f -mtime -N -print`. This is actually the correct behavior for GNU find. BUT on some POSIX find implementations (BusyBox find), the behavior of `-prune` with `-o` can differ. The real bug is that `-path /proc -prune` will match `/proc` itself but NOT necessarily prevent descent into `/proc` on all implementations when combined with `-o` at the outer level.",
+    "impact": "On BusyBox find (the primary target), excluded directories like /proc or /sys may still be descended into, causing the collector to hang reading from /proc pseudo-files or generating errors.",
+    "suggestion": "Use the more portable form: `find DIR \\( -path P1 -o -path P2 \\) -prune -o -type f -mtime -N -print`. This groups all prune paths together with a single `-prune` action, which is more reliably handled across find implementations.",
+    "false_positive_risk": "medium"
+  },
+  {
+    "id": "F7",
+    "severity": "HIGH",
+    "location": "upload_with_wget / lines ~360-385",
+    "title": "wget --header with shell_quote may fail on some wget versions due to quoting of boundary value",
+    "description": "The wget command uses `--header=` with shell_quote around the entire header value including the boundary. The resulting shell command looks like: `wget ... --header='Content-Type: multipart/form-data; boundary=ThunderstormBoundaryXXX'`. While this is correct shell quoting, some versions of wget (particularly older BusyBox wget) parse `--header=VALUE` by splitting on the first colon to get the header name, and may not handle the single-quoted value correctly when the shell expands it. More critically, the boundary value is embedded directly without quoting in the HTTP header (the shell quotes are stripped by the shell before wget sees the value), so this is actually fine. The real issue is that `--post-file` in BusyBox wget sends the file content as-is without setting Content-Length, and some BusyBox wget versions override Content-Type when using --post-file.",
+    "impact": "BusyBox wget may send incorrect Content-Type or missing Content-Length, causing server-side parse failures for binary file uploads.",
+    "suggestion": "This is documented as a known limitation for busybox-wget. For the standard wget path, add `--header='Content-Length: BODY_LEN'` explicitly since wget with --post-file may not set it. Use body_len from build_multipart_body.",
+    "false_positive_risk": "medium"
+  },
+  {
+    "id": "F8",
+    "severity": "HIGH",
+    "location": "scan_directory / lines ~580-640",
+    "title": "io.popen handle not closed on error path — resource leak",
+    "description": "scan_directory opens a popen handle and wraps the iteration in pcall. If pcall catches an error, `handle:close()` is called after the pcall block. However, if `handle:lines()` itself throws (which can happen if the popen'd process writes to a broken pipe), the pcall will catch it and execution jumps to after the pcall block where handle:close() is called. This part is actually correct. BUT: if `io.popen(cmd)` returns a handle but the find process immediately exits with an error (e.g., permission denied on the root dir), handle:lines() will return nil on the first call, the for loop exits normally, and handle:close() is called — this is fine. The actual issue is that `handle:close()` in Lua 5.1 does not return the exit status of the child process, so failed find commands are silently ignored.",
+    "impact": "If find fails entirely (e.g., directory not accessible), the error is silently swallowed and the scan appears to succeed with 0 files.",
+    "suggestion": "After handle:close(), check if files_scanned didn't increase and log a warning. Alternatively, redirect find's stderr to a temp file and check it after the scan.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F9",
+    "severity": "HIGH",
+    "location": "main / scan_id append to api_endpoint, lines ~680-685",
+    "title": "scan_id appended to api_endpoint without JSON/URL escaping validation",
+    "description": "The scan_id is extracted from the server response with `resp:match('\"scan_id\"%s*:%s*\"([^\"]+)\"')`. This regex captures everything between quotes, which could include URL-special characters if the server returns an unexpected scan_id format. The scan_id is then passed through urlencode() before appending to the URL, which is correct. However, the scan_id is also passed to send_collection_marker as a raw string and embedded in JSON via json_escape(). If the server returns a scan_id containing characters that break the JSON structure (e.g., a scan_id with `\"`), json_escape handles it. This is actually fine. The real issue is that the scan_id regex `[^\"]+` will match any non-quote character including newlines if the response spans multiple lines, potentially capturing more than intended.",
+    "impact": "Low risk in practice since scan_id is server-generated, but a malicious or buggy server could inject unexpected values.",
+    "suggestion": "Restrict the scan_id pattern to safe characters: `resp:match('\"scan_id\"%s*:%s*\"([A-Za-z0-9_%-]+)\"')` or limit length: capture up to 64 chars.",
+    "false_positive_risk": "medium"
+  },
+  {
+    "id": "F10",
+    "severity": "HIGH",
+    "location": "parse_proc_mounts / lines ~200-220",
+    "title": "Octal escape decoding in /proc/mounts only handles 3-digit sequences — \\040 correct but pattern is fragile",
+    "description": "The octal decode uses `mp:gsub(\"\\\\(%d%d%d)\", ...)` which matches exactly 3 digits after a backslash. In /proc/mounts, spaces are encoded as `\\040`. This is correct. However, the pattern `\\(%d%d%d)` in Lua will also match `\\123` in a path like `/mnt/path\\1234` (matching `\\123` and leaving `4`). More importantly, the pattern uses `\\` as a literal backslash in the gsub pattern, but in Lua string literals `\\` is an escaped backslash, so the pattern string is `\(%d%d%d)` which in Lua pattern syntax means: literal `\`, then capture 3 digits. But `\` is not a special pattern character in Lua, so it matches a literal backslash. This is actually correct behavior. The real issue: if a mount point contains `\\040` (double backslash followed by 040), the decode will incorrectly convert `\\040` to `\` + space instead of `\\` + space.",
+    "impact": "Mount points with unusual characters in their names may not be correctly excluded, potentially causing the collector to scan network or special filesystems.",
+    "suggestion": "This is an edge case with low real-world impact. The fix would be to handle `\\\\` (escaped backslash) before handling `\\040` etc. But for embedded systems, this is unlikely to matter.",
+    "false_positive_risk": "medium"
+  },
+  {
+    "id": "F11",
+    "severity": "MEDIUM",
+    "location": "mktemp / lines ~130-140",
+    "title": "Temp files created in world-writable directories without restricted permissions",
+    "description": "mktemp() calls the shell `mktemp` command which by default creates files in /tmp with mode 0600 — this is safe. However, the fallback `os.tmpname()` returns a path (typically in /tmp) but does NOT create the file atomically with restricted permissions. The subsequent `io.open(path, 'wb')` creates the file, but between os.tmpname() returning the path and io.open() creating it, another process could create a symlink at that path pointing to a sensitive file, causing the collector to overwrite it (symlink attack / TOCTOU race).",
+    "impact": "On multi-user systems, a local attacker could exploit the TOCTOU window in the os.tmpname() fallback to overwrite arbitrary files writable by the collector's user.",
+    "suggestion": "The mktemp shell command fallback is already the primary path and is safe. For the os.tmpname() fallback, add a check: after io.open(), verify the file is a regular file (not a symlink) using `test -f` and `test ! -L`. Or use `mktemp` with a fallback to a process-specific path like `/tmp/thunderstorm-$$-RANDOM`.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F12",
+    "severity": "MEDIUM",
+    "location": "upload_with_curl / response check, lines ~345-355",
+    "title": "Server rejection detection checks for '\"reason\"' in response body — too broad, may false-positive on legitimate responses",
+    "description": "The code checks `resp_body:lower():find('\"reason\"')` to detect server-side rejection. This will match any JSON response containing a 'reason' field, including success responses that happen to include a reason field (e.g., `{\"status\":\"ok\",\"reason\":\"file already scanned\"}`). This would cause successfully uploaded files to be counted as failures.",
+    "impact": "Files that were successfully uploaded but whose server response contains a 'reason' field will be incorrectly marked as failed, incrementing files_failed and potentially causing exit code 1.",
+    "suggestion": "Check for HTTP error status codes instead of (or in addition to) response body content. With curl's `--fail`, non-2xx responses already cause a non-zero exit. The response body check should be more specific, e.g., check for `\"error\"` or `\"status\":\"error\"` rather than just `\"reason\"`.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F13",
+    "severity": "MEDIUM",
+    "location": "build_find_command / lines ~540-560",
+    "title": "find -mtime uses integer days — files modified within the last 24h may be missed or double-counted at boundary",
+    "description": "The find command uses `-mtime -N` where N is config.max_age. POSIX find's -mtime counts in 24-hour periods rounded down, so `-mtime -14` finds files modified in the last 14*24=336 hours. This is standard behavior. However, if max_age is 0, the command becomes `-mtime -0` which on GNU find matches files modified in the last 0 days (i.e., nothing), while on some POSIX implementations `-mtime -0` matches files modified less than 24 hours ago. The validate_config() allows max_age >= 0, so max_age=0 is valid but will produce no results on GNU find.",
+    "impact": "With --max-age 0, the collector silently scans nothing (on GNU find) or scans files from the last 24h (on some POSIX find). The user gets no warning.",
+    "suggestion": "Either reject max_age=0 in validate_config() with a clear error, or document this behavior. Alternatively, use `-mtime -1` as minimum or use `-newer` with a reference file for more precise time control.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F14",
+    "severity": "MEDIUM",
+    "location": "detect_upload_tool / wget_is_busybox, lines ~240-270",
+    "title": "wget version detection uses exec_capture which may fail silently — BusyBox wget may be used as GNU wget",
+    "description": "wget_is_busybox() runs `wget --version 2>&1` and checks if the output contains 'busybox'. If exec_capture returns nil (popen failed) or the output doesn't contain 'busybox', it returns false, treating the wget as GNU wget. On some embedded systems, `wget --version` may not be supported (BusyBox wget may not implement --version) and returns an error or empty output, causing wget_is_busybox() to return false incorrectly. This means BusyBox wget would be used as if it were GNU wget, which has different --post-file behavior.",
+    "impact": "BusyBox wget used as GNU wget may fail to upload binary files correctly, with no warning to the user.",
+    "suggestion": "Also check if `wget --version` returns a non-zero exit code or empty output as an indicator of BusyBox wget. Alternatively, check for 'GNU Wget' in the output (positive identification) rather than checking for 'busybox' (negative identification).",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F15",
+    "severity": "MEDIUM",
+    "location": "send_collection_marker / lines ~455-530",
+    "title": "send_collection_marker ignores upload failures silently — begin/end markers may be lost without warning",
+    "description": "send_collection_marker uses `os.execute(cmd)` for curl and wget paths (not exec_ok), so the return value is ignored. If the marker upload fails, the function returns \"\" (no scan_id extracted), and the caller logs a warning for the begin marker. But for the end marker, the return value of send_collection_marker is not checked at all in main(). Failed end markers are silently dropped.",
+    "impact": "The Thunderstorm server may not receive end markers, leaving collection sessions open. This is a reliability issue for the server-side tracking of collection runs.",
+    "suggestion": "Use exec_ok() instead of os.execute() for the marker upload commands, and return a boolean success indicator in addition to the scan_id. Log a warning if the end marker fails.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F16",
+    "severity": "MEDIUM",
+    "location": "is_cloud_path / lines ~225-240",
+    "title": "Cloud path detection uses case-insensitive match but path separator check is case-sensitive",
+    "description": "is_cloud_path() converts the path to lowercase with `path:lower()` and then checks for `\"/\" .. name .. \"/\"`. The CLOUD_DIR_NAMES entries are already lowercase. This is correct for the directory name matching. However, the check `lower:sub(-(#name + 1)) == \"/\" .. name` checks if the path ends with `/name`. This misses paths that end without a trailing slash AND where the directory is the last component without a slash prefix in the lowercased string (e.g., a path that IS exactly the cloud dir name without any leading slash). This is an edge case that's unlikely in practice.",
+    "impact": "Minimal — cloud storage paths that are exact matches without leading slash won't be excluded. In practice, all real paths start with /.",
+    "suggestion": "This is a very minor edge case. No change needed unless paths without leading slashes are expected.",
+    "false_positive_risk": "high"
+  },
+  {
+    "id": "F17",
+    "severity": "MEDIUM",
+    "location": "main / lines ~700-710",
+    "title": "scan_id appended to api_endpoint with separator logic that may produce double '?' if source is empty",
+    "description": "The api_endpoint is built as `base_url/api/endpoint?source=X` if source is non-empty, or `base_url/api/endpoint` if source is empty. Then scan_id is appended with: `local sep = \"&\"; if not api_endpoint:find(\"?\") then sep = \"?\" end`. If source is empty, api_endpoint has no `?`, so sep becomes `?`. If source is non-empty, sep is `&`. This logic is correct. However, `api_endpoint:find(\"?\")` — the `?` character in Lua patterns is a quantifier meaning 'zero or one of the previous'. So `find(\"?\")` actually matches an empty string at position 1 (since `?` makes the preceding pattern optional, and there's no preceding pattern, it matches zero characters). This means `find(\"?\")` always returns 1 (truthy), so sep is always `&`, and scan_id is always appended with `&` even when there's no `?` in the URL.",
+    "impact": "The API endpoint becomes `http://server:port/api/checkAsync&scan_id=XXX` instead of `http://server:port/api/checkAsync?scan_id=XXX` when source is empty. This produces an invalid URL and the server will not receive the scan_id.",
+    "suggestion": "Use `find(\"?\", 1, true)` for plain string search (the third argument `true` disables pattern matching): `if not api_endpoint:find(\"?\", 1, true) then sep = \"?\" end`.",
+    "false_positive_risk": "low"
+  },
+  {
+    "id": "F18",
+    "severity": "MEDIUM",
+    "location": "submit_file / exponential backoff, lines ~445-455",
+    "title": "Exponential backoff calculation is O(n) loop instead of direct formula",
+    "description": "The backoff delay is computed as: `local delay = 1; for _ = 2, attempt do delay = delay * 2 end`. For attempt=1, the loop runs 0 times (2 to 1 is empty), delay=1. For attempt=2, loop runs once, delay=2. For attempt=3, loop runs twice, delay=4. This gives delays of 1, 2, 4 seconds for attempts 1, 2, 3. The logic is correct but unnecessarily complex. More importantly, with default retries=3, the maximum total wait is 1+2=3 seconds (no sleep after the last attempt), which is reasonable. No bug here, just unnecessary complexity.",
+    "impact": "No functional impact. Minor code quality issue.",
+    "suggestion": "Replace with `local delay = math.pow(2, attempt - 1)` or in Lua 5.1: `local delay = 2 ^ (attempt - 1)`. Note: Lua 5.1 supports the `^` operator for exponentiation.",
+    "false_positive_risk": "high"
+  },
+  {
+    "id": "F19",
+    "severity": "LOW",
+    "location": "log_msg / syslog branch, lines ~165-172",
+    "title": "Syslog logger command uses shell_quote for message but facility.priority is not validated",
+    "description": "The syslog logger command is: `logger -p FACILITY.PRIORITY MESSAGE`. The facility comes from config.syslog_facility which is user-controlled via... actually it's not exposed via CLI args (no --syslog-facility option), so it uses the hardcoded default 'user'. The priority is derived from the level parameter which is controlled by the code itself. However, if someone adds a --syslog-facility option in the future, the facility value is concatenated directly into the shell command without shell_quote: `shell_quote(config.syslog_facility .. \".\" .. prio)`. Wait — it IS wrapped in shell_quote. So this is actually safe. The only issue is that an invalid facility name would cause logger to fail silently (2>/dev/null).",
+    "impact": "Minimal — syslog messages silently dropped if facility is invalid.",
+    "suggestion": "No immediate action needed. If --syslog-facility is added as a CLI option, validate it against known facility names.",
+    "false_positive_risk": "high"
+  },
+  {
+    "id": "F20",
+    "severity": "LOW",
+    "location": "global scope / lines ~30-60",
+    "title": "All globals are in global namespace — risk of accidental pollution in embedded Lua environments",
+    "description": "VERSION, config, counters, EXCLUDE_PATHS, dynamic_excludes, etc. are all global variables. In Lua 5.1, globals are stored in the global environment table. On embedded systems running multiple Lua scripts or using Lua as an embedded scripting engine, global pollution can cause unexpected interactions. Additionally, the pcall(main) at the bottom references `config` and `counters` as globals in the error handler, which works but is fragile.",
+    "impact": "Low risk for a standalone script. Would matter if this script is require()'d by another Lua program.",
+    "suggestion": "Wrap the entire script in a `do ... end` block or use `local` for all module-level variables. At minimum, make VERSION, config, counters local to main() or a module table.",
+    "false_positive_risk": "high"
+  }
+]
+```
