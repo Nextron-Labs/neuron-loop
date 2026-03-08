@@ -1,0 +1,10 @@
+# Neuron-Loop
+output*/
+__pycache__/
+*.pyc
+
+# Task files are project-specific
+task-*.md
+
+# Don't commit API keys
+.env

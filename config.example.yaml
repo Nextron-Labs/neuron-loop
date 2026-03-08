@@ -1,0 +1,65 @@
+# Neuron-Loop Configuration
+# Copy to config.yaml and adjust for your setup.
+#
+# Models are loaded from OpenClaw's models.json automatically.
+# You only need to specify provider name + model ID here.
+# API keys come from your OpenClaw config — no secrets in this file.
+
+# ─── Model Tiers ────────────────────────────────────────────
+tiers:
+  # The model that writes fixes
+  coder:
+    model: "anthropic/claude-sonnet-4-6"
+
+  # Tier 1: Deep reviewers (high quality, may cost money)
+  # Run in parallel. Cross-referenced for confidence.
+  tier1:
+    - provider: anthropic
+      model: "claude-sonnet-4-6"
+      label: "sonnet"
+    - provider: openai
+      model: "gpt-5.4"
+      label: "gpt54"
+
+  # Tier 2: Sweep reviewers (cheaper/free, broader coverage)
+  # Higher false positive rate (~30%), but occasionally catch
+  # things Tier 1 models miss.
+  tier2:
+    - provider: ollama-cloud
+      model: "glm-5:cloud"
+      label: "glm5"
+    - provider: openrouter
+      model: "auto"
+      label: "openrouter"
+    # - provider: xai
+    #   model: "grok-4-1-fast-reasoning"
+    #   label: "grok"
+
+# ─── Gate Rules ─────────────────────────────────────────────
+# How findings are triaged across models.
+gate:
+  # Findings from N+ models → auto-fix (no debate)
+  auto_fix_threshold: 2
+  # Finding from 1 Tier 1 model → fix (assess carefully)
+  tier1_single_action: "fix"
+  # Finding from 1 Tier 2 model only → skip unless CRITICAL
+  tier2_single_action: "skip_unless_critical"
+
+# ─── Loop Limits ────────────────────────────────────────────
+loop:
+  max_iterations: 10
+  convergence_threshold: 0   # Stop when ≤ N findings remain
+  timeout_seconds: 3600
+
+# ─── Test Configuration ────────────────────────────────────
+test:
+  # Shell command to run tests. Exit 0 = pass.
+  command: ""
+  before_review: true
+  after_fix: true
+
+# ─── Output ─────────────────────────────────────────────────
+output:
+  dir: "./output"
+  keep_intermediates: true
+  verbose: true

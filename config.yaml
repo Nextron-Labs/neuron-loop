@@ -1,0 +1,71 @@
+# Neuron-Loop Configuration
+# Coding ↔ Review ↔ Test Loop Orchestrator
+
+# ─── Model Tiers ────────────────────────────────────────────
+# Tier 1: Deep reviewers (high quality, may cost money)
+# Tier 2: Sweep reviewers (cheaper/free, broader coverage)
+# Coder: The model that writes/fixes code
+
+tiers:
+  coder:
+    # Model that writes and fixes code
+    model: "anthropic/claude-sonnet-4-6"
+    role: "coder"
+
+  tier1:
+    # Deep reviewers — run in parallel, cross-reference findings
+    - provider: anthropic
+      model: "claude-sonnet-4-6"
+      label: "sonnet"
+    - provider: openai
+      model: "gpt-5.4"
+      label: "gpt54"
+
+  tier2:
+    # Sweep reviewers — cheaper/free, catch obvious issues
+    - provider: ollama-cloud
+      model: "glm-5:cloud"
+      label: "glm5"
+    - provider: openrouter
+      model: "auto"
+      label: "openrouter"
+    # Uncomment to add more:
+    # - provider: xai
+    #   model: "grok-4-1-fast-reasoning"
+    #   label: "grok"
+
+# ─── Gate Rules ─────────────────────────────────────────────
+# How to triage findings across models
+gate:
+  # Findings from N+ models → auto-fix (no debate)
+  auto_fix_threshold: 2
+  # Findings from 1 Tier 1 model → assess carefully (include in fixes)
+  tier1_single_action: "fix"
+  # Findings from 1 Tier 2 model only → skip unless CRITICAL
+  tier2_single_action: "skip_unless_critical"
+
+# ─── Loop Limits ────────────────────────────────────────────
+loop:
+  max_iterations: 10       # Hard stop
+  max_coder_rounds: 20     # Max rounds per coder session
+  convergence_threshold: 0 # Stop when this many or fewer findings remain
+  timeout_seconds: 3600    # Overall timeout
+
+# ─── Test Configuration ────────────────────────────────────
+test:
+  # Command to run tests. Must exit 0 on success.
+  # Use {workdir} placeholder for the working directory.
+  command: ""
+  # Run tests before review? (catches obvious breaks early)
+  before_review: true
+  # Run tests after fixes? (verify fixes don't break things)
+  after_fix: true
+
+# ─── Output ─────────────────────────────────────────────────
+output:
+  # Directory for reports, logs, intermediate files
+  dir: "./output"
+  # Keep intermediate review files?
+  keep_intermediates: true
+  # Verbose console output
+  verbose: true
