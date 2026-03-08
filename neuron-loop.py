@@ -21,11 +21,12 @@ import os
 import sys
 import time
 import hashlib
-import threading
 import subprocess
 import re
+import logging
+import copy
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ─── Constants ──────────────────────────────────────────────
@@ -33,13 +34,173 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 SCRIPT_DIR = Path(__file__).parent
 DEFAULT_CONFIG = SCRIPT_DIR / "config.yaml"
 OPENCLAW_MODELS = Path.home() / ".openclaw/agents/main/agent/models.json"
+VERSION = "0.2.0"
 
-# ─── Provider API Clients ──────────────────────────────────
+# ─── Logging Setup ──────────────────────────────────────────
 
 import urllib.request
 import urllib.error
 import ssl
 
+
+class StructuredLogger:
+    """Structured logging with both human-readable console and JSON file output."""
+
+    def __init__(self, run_dir, verbose=True):
+        self.run_dir = Path(run_dir)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.verbose = verbose
+
+        # JSON event log — every structured event
+        self.events_path = self.run_dir / "events.jsonl"
+        self.events_file = open(self.events_path, "a")
+
+        # Human-readable log
+        self.log_path = self.run_dir / "neuron-loop.log"
+        self.log_file = open(self.log_path, "a")
+
+        self._event_id = 0
+
+    def _ts(self):
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _write_event(self, event_type, data):
+        self._event_id += 1
+        event = {
+            "id": self._event_id,
+            "ts": self._ts(),
+            "type": event_type,
+            **data,
+        }
+        self.events_file.write(json.dumps(event, default=str) + "\n")
+        self.events_file.flush()
+        return event
+
+    def _write_log(self, level, msg):
+        ts = self._ts()
+        line = f"[{ts}] [{level}] {msg}"
+        self.log_file.write(line + "\n")
+        self.log_file.flush()
+        if self.verbose:
+            print(line)
+
+    def info(self, msg, **data):
+        self._write_log("INFO", msg)
+        if data:
+            self._write_event("info", {"message": msg, **data})
+
+    def warn(self, msg, **data):
+        self._write_log("WARN", msg)
+        self._write_event("warning", {"message": msg, **data})
+
+    def error(self, msg, **data):
+        self._write_log("ERROR", msg)
+        self._write_event("error", {"message": msg, **data})
+
+    def event(self, event_type, **data):
+        self._write_event(event_type, data)
+
+    def close(self):
+        self.events_file.close()
+        self.log_file.close()
+
+
+# ─── Run Directory Structure ────────────────────────────────
+
+class RunStorage:
+    """Manages structured storage for a single Neuron-Loop run.
+
+    Directory layout:
+        runs/
+          YYYY-MM-DD_HHMMSS_{task_name}/
+            config.json              — frozen config snapshot (no secrets)
+            task.md                  — copy of task prompt
+            events.jsonl             — structured event log
+            neuron-loop.log          — human-readable log
+            summary.json             — final summary
+            files/
+              original/              — original file snapshots
+              iter-01/               — files after iteration 1 fixes
+              iter-02/               — ...
+            reviews/
+              iter-01/
+                sonnet-raw.md        — raw response
+                sonnet-findings.json — extracted findings
+                gpt54-raw.md
+                gpt54-findings.json
+              iter-02/
+                ...
+            triage/
+              iter-01.json           — triaged/deduplicated findings
+            fixes/
+              iter-01-request.md     — prompt sent to coder
+              iter-01-response.md    — raw coder response
+            tests/
+              iter-01-pre.txt        — pre-review test output
+              iter-01-post.txt       — post-fix test output
+    """
+
+    def __init__(self, base_dir, task_name):
+        ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        safe_name = re.sub(r'[^\w-]', '_', task_name)[:40]
+        self.run_dir = Path(base_dir) / f"{ts}_{safe_name}"
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+
+        # Sub-directories
+        for subdir in ["files/original", "reviews", "triage", "fixes", "tests"]:
+            (self.run_dir / subdir).mkdir(parents=True, exist_ok=True)
+
+    def save_config(self, config):
+        """Save config snapshot (strip any accidentally included secrets)."""
+        safe = copy.deepcopy(config)
+        # Remove anything that looks like a key
+        for key in list(safe.keys()):
+            if "key" in key.lower() or "secret" in key.lower() or "token" in key.lower():
+                safe[key] = "***REDACTED***"
+        (self.run_dir / "config.json").write_text(json.dumps(safe, indent=2, default=str))
+
+    def save_task(self, task_text):
+        (self.run_dir / "task.md").write_text(task_text)
+
+    def save_original_file(self, filename, content):
+        (self.run_dir / "files" / "original" / filename).write_text(content)
+
+    def save_iteration_file(self, iteration, filename, content):
+        iter_dir = self.run_dir / "files" / f"iter-{iteration:02d}"
+        iter_dir.mkdir(parents=True, exist_ok=True)
+        (iter_dir / filename).write_text(content)
+
+    def save_review(self, iteration, label, raw_response, findings):
+        review_dir = self.run_dir / "reviews" / f"iter-{iteration:02d}"
+        review_dir.mkdir(parents=True, exist_ok=True)
+        (review_dir / f"{label}-raw.md").write_text(raw_response or "(no response)")
+        (review_dir / f"{label}-findings.json").write_text(
+            json.dumps(findings, indent=2, default=str)
+        )
+
+    def save_triage(self, iteration, triaged):
+        (self.run_dir / "triage" / f"iter-{iteration:02d}.json").write_text(
+            json.dumps(triaged, indent=2, default=str)
+        )
+
+    def save_fix_request(self, iteration, prompt):
+        (self.run_dir / "fixes" / f"iter-{iteration:02d}-request.md").write_text(prompt)
+
+    def save_fix_response(self, iteration, response):
+        (self.run_dir / "fixes" / f"iter-{iteration:02d}-response.md").write_text(
+            response or "(no response)"
+        )
+
+    def save_test_output(self, iteration, phase, success, output):
+        (self.run_dir / "tests" / f"iter-{iteration:02d}-{phase}.txt").write_text(
+            f"# Result: {'PASS' if success else 'FAIL'}\n\n{output}"
+        )
+
+    def save_summary(self, summary):
+        (self.run_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
+
+
+# ─── Provider API Clients ──────────────────────────────────
 
 def load_openclaw_providers():
     """Load provider configs from OpenClaw's models.json."""
@@ -54,7 +215,6 @@ def load_openclaw_providers():
 def api_call_openai_compat(base_url, api_key, model, messages, max_tokens=8192, timeout=300):
     """Call an OpenAI-compatible API (OpenAI, xAI, Ollama Cloud, OpenRouter)."""
     url = f"{base_url.rstrip('/')}/chat/completions"
-    # OpenAI's newer models require max_completion_tokens instead of max_tokens
     is_openai = "api.openai.com" in base_url
     token_key = "max_completion_tokens" if is_openai else "max_tokens"
     body = json.dumps({
@@ -75,21 +235,20 @@ def api_call_openai_compat(base_url, api_key, model, messages, max_tokens=8192, 
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            return data["choices"][0]["message"]["content"]
+            usage = data.get("usage", {})
+            content = data["choices"][0]["message"]["content"]
+            return content, usage
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")[:500]
-        print(f"[ERROR] API {url} returned {e.code}: {error_body}")
-        return None
-    except Exception as e:
-        print(f"[ERROR] API call to {url} failed: {e}")
-        return None
+        raise RuntimeError(f"HTTP {e.code}: {error_body}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Connection failed: {e.reason}")
 
 
 def api_call_anthropic(api_key, model, messages, max_tokens=8192, timeout=300):
     """Call Anthropic's native API."""
     url = "https://api.anthropic.com/v1/messages"
 
-    # Convert from OpenAI format to Anthropic format
     system_msg = ""
     anthropic_messages = []
     for m in messages:
@@ -118,17 +277,15 @@ def api_call_anthropic(api_key, model, messages, max_tokens=8192, timeout=300):
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            # Anthropic returns content as array of blocks
             content_blocks = data.get("content", [])
             text_parts = [b["text"] for b in content_blocks if b.get("type") == "text"]
-            return "\n".join(text_parts)
+            usage = data.get("usage", {})
+            return "\n".join(text_parts), usage
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")[:500]
-        print(f"[ERROR] Anthropic API returned {e.code}: {error_body}")
-        return None
-    except Exception as e:
-        print(f"[ERROR] Anthropic API call failed: {e}")
-        return None
+        raise RuntimeError(f"HTTP {e.code}: {error_body}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Connection failed: {e.reason}")
 
 
 def api_call_ollama(base_url, model, messages, max_tokens=8192, timeout=600):
@@ -151,49 +308,63 @@ def api_call_ollama(base_url, model, messages, max_tokens=8192, timeout=600):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            return data.get("message", {}).get("content", "")
+            content = data.get("message", {}).get("content", "")
+            usage = {
+                "prompt_tokens": data.get("prompt_eval_count", 0),
+                "completion_tokens": data.get("eval_count", 0),
+            }
+            return content, usage
     except Exception as e:
-        print(f"[ERROR] Ollama API call failed: {e}")
-        return None
+        raise RuntimeError(f"Ollama call failed: {e}")
 
 
 class ModelClient:
     """Unified interface for calling any configured model."""
 
-    def __init__(self, providers):
+    def __init__(self, providers, logger):
         self.providers = providers
+        self.logger = logger
 
     def call(self, provider_name, model_id, messages, max_tokens=8192, timeout=300):
-        """Call a model through its provider."""
+        """Call a model. Returns (content, usage_dict). Raises RuntimeError on failure."""
         prov = self.providers.get(provider_name)
         if not prov:
-            print(f"[ERROR] Unknown provider: {provider_name}")
-            return None
+            raise RuntimeError(f"Unknown provider: {provider_name}")
 
         api_type = prov.get("api", "openai-completions")
         api_key = prov.get("apiKey", "")
         base_url = prov.get("baseUrl", "")
 
-        if api_type == "anthropic":
-            return api_call_anthropic(api_key, model_id, messages, max_tokens, timeout)
-        elif api_type == "ollama":
-            return api_call_ollama(base_url, model_id, messages, max_tokens, timeout)
-        else:
-            return api_call_openai_compat(base_url, api_key, model_id, messages, max_tokens, timeout)
+        t0 = time.time()
+        try:
+            if api_type == "anthropic":
+                content, usage = api_call_anthropic(api_key, model_id, messages, max_tokens, timeout)
+            elif api_type == "ollama":
+                content, usage = api_call_ollama(base_url, model_id, messages, max_tokens, timeout)
+            else:
+                content, usage = api_call_openai_compat(base_url, api_key, model_id, messages, max_tokens, timeout)
+
+            elapsed = time.time() - t0
+            self.logger.event("api_call", provider=provider_name, model=model_id,
+                              elapsed_s=round(elapsed, 1), usage=usage, success=True)
+            return content, usage
+
+        except RuntimeError as e:
+            elapsed = time.time() - t0
+            self.logger.event("api_call", provider=provider_name, model=model_id,
+                              elapsed_s=round(elapsed, 1), success=False, error=str(e))
+            raise
 
 
 # ─── Config Loading ─────────────────────────────────────────
 
 def load_config(config_path):
-    """Load YAML config (minimal parser — no PyYAML dependency)."""
-    # Simple YAML-like parser for our flat config
-    # For full YAML, users can install PyYAML
+    """Load YAML config."""
     try:
         import yaml
         with open(config_path) as f:
             return yaml.safe_load(f)
     except ImportError:
-        # Fallback: return defaults
         return default_config()
 
 
@@ -228,14 +399,14 @@ def default_config():
             "after_fix": True,
         },
         "output": {
-            "dir": "./output",
+            "dir": "./runs",
             "keep_intermediates": True,
             "verbose": True,
         },
     }
 
 
-# ─── Review Prompt Building ────────────────────────────────
+# ─── Prompt Building ───────────────────────────────────────
 
 def load_prompt_template(name):
     """Load a prompt template from the prompts directory."""
@@ -249,13 +420,12 @@ def build_review_prompt(files_content, context="", standards=""):
     """Build the review prompt with file contents injected."""
     template = load_prompt_template("reviewer")
     if not template:
-        template = "Review the following code for bugs, security issues, and correctness.\n\n{file_list}"
+        template = "Review the following code for bugs and security issues.\n\n{file_list}"
 
     file_list = ""
     for name, content in files_content.items():
         file_list += f"\n### {name}\n```\n{content}\n```\n"
 
-    # Use safe substitution to avoid KeyError on JSON templates with {braces}
     result = template
     result = result.replace("{file_list}", file_list)
     result = result.replace("{context}", context or "General code review.")
@@ -267,7 +437,7 @@ def build_fix_prompt(files_content, findings_text, context=""):
     """Build the coder fix prompt."""
     template = load_prompt_template("coder")
     if not template:
-        template = "Fix the following issues in the code.\n\n{findings}\n\n{code}"
+        template = "Fix the following issues.\n\n{findings}\n\n{code}"
 
     code = ""
     for name, content in files_content.items():
@@ -287,11 +457,9 @@ def extract_findings(response_text):
     if not response_text:
         return []
 
-    # Try to find JSON array in the response
-    # Look for [...] pattern
     findings = []
 
-    # Method 1: Find JSON array
+    # Method 1: Find JSON array with severity fields
     json_match = re.search(r'\[[\s\S]*?\{[\s\S]*?"severity"[\s\S]*?\}[\s\S]*?\]', response_text)
     if json_match:
         try:
@@ -313,13 +481,11 @@ def extract_findings(response_text):
         return findings
 
     # Method 3: Parse structured text (fallback)
-    # Look for numbered findings with severity markers
     text_findings = []
     current = None
     for line in response_text.split("\n"):
         sev_match = re.match(r'.*?\b(CRITICAL|HIGH|MEDIUM|LOW)\b', line, re.IGNORECASE)
-        if sev_match and ("finding" in line.lower() or "." in line[:5] or re.match(r'^\s*\d+', line)
-                          or re.match(r'^\s*[#*-]', line)):
+        if sev_match and (re.match(r'^\s*[\d#*-]', line) or "finding" in line.lower()):
             if current:
                 text_findings.append(current)
             current = {
@@ -354,56 +520,73 @@ def normalize_finding(finding):
 
 def fingerprint_finding(f):
     """Create a fuzzy fingerprint for deduplication."""
-    # Combine severity + key words from title/description
     text = f"{f.get('severity','')} {f.get('title','')} {f.get('location','')}".lower()
-    # Remove common words
-    for w in ["the", "a", "an", "is", "in", "for", "of", "to", "and", "or", "not"]:
-        text = text.replace(f" {w} ", " ")
-    # Normalize whitespace
-    text = " ".join(text.split())
-    return text
+    stopwords = {"the", "a", "an", "is", "in", "for", "of", "to", "and", "or", "not",
+                 "no", "does", "are", "has", "have", "with", "on", "by", "it"}
+    words = [w for w in text.split() if w not in stopwords and len(w) > 2]
+    return " ".join(sorted(set(words)))
+
+
+def similarity(fp1, fp2):
+    """Jaccard similarity between two fingerprints."""
+    w1 = set(fp1.split())
+    w2 = set(fp2.split())
+    if not w1 or not w2:
+        return 0.0
+    return len(w1 & w2) / len(w1 | w2)
 
 
 def deduplicate_findings(all_findings_by_model, gate_config):
-    """Cross-reference findings across models and apply gate rules.
-
-    Returns list of (finding, models_that_found_it, action) tuples.
-    """
+    """Cross-reference findings across models and apply gate rules."""
     auto_fix = gate_config.get("auto_fix_threshold", 2)
     t1_action = gate_config.get("tier1_single_action", "fix")
     t2_action = gate_config.get("tier2_single_action", "skip_unless_critical")
 
-    # Group findings by fuzzy fingerprint
-    fingerprint_map = {}  # fingerprint → [(finding, model_label, tier)]
+    SIMILARITY_THRESHOLD = 0.35
 
+    # Collect all findings with metadata
+    all_entries = []
     for model_label, (findings, tier) in all_findings_by_model.items():
         for f in findings:
             nf = normalize_finding(f)
             fp = fingerprint_finding(nf)
-            if fp not in fingerprint_map:
-                fingerprint_map[fp] = []
-            fingerprint_map[fp].append((nf, model_label, tier))
+            all_entries.append((nf, model_label, tier, fp))
 
-    # Apply gate rules
+    # Cluster by similarity
+    clusters = []  # Each cluster: list of (finding, model, tier, fingerprint)
+    used = set()
+
+    for i, (f1, m1, t1, fp1) in enumerate(all_entries):
+        if i in used:
+            continue
+        cluster = [(f1, m1, t1, fp1)]
+        used.add(i)
+        for j, (f2, m2, t2, fp2) in enumerate(all_entries):
+            if j in used:
+                continue
+            if similarity(fp1, fp2) >= SIMILARITY_THRESHOLD:
+                cluster.append((f2, m2, t2, fp2))
+                used.add(j)
+        clusters.append(cluster)
+
+    # Apply gate rules per cluster
     triaged = []
-    for fp, entries in fingerprint_map.items():
-        n_models = len(entries)
-        best_finding = entries[0][0]  # Use first occurrence as canonical
-        models = [e[1] for e in entries]
-        tiers = set(e[2] for e in entries)
+    for cluster in clusters:
+        models = list(set(e[1] for e in cluster))
+        tiers = set(e[2] for e in cluster)
+        n_models = len(models)
 
-        # Merge: take highest severity across models
-        severities = [e[0]["severity"] for e in entries]
+        # Use the highest-severity finding as canonical
         sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-        best_sev = min(severities, key=lambda s: sev_order.get(s, 99))
-        best_finding["severity"] = best_sev
+        best = min(cluster, key=lambda e: sev_order.get(e[0]["severity"], 99))
+        finding = best[0]
 
         if n_models >= auto_fix:
             action = "fix"
-        elif 1 in tiers:  # At least one Tier 1 model found it
+        elif 1 in tiers:
             action = t1_action
-        else:  # Tier 2 only
-            if t2_action == "skip_unless_critical" and best_sev == "CRITICAL":
+        else:
+            if t2_action == "skip_unless_critical" and finding["severity"] == "CRITICAL":
                 action = "fix"
             elif t2_action == "skip_unless_critical":
                 action = "skip"
@@ -411,15 +594,15 @@ def deduplicate_findings(all_findings_by_model, gate_config):
                 action = t2_action
 
         triaged.append({
-            "finding": best_finding,
+            "finding": finding,
             "models": models,
             "n_models": n_models,
             "tiers": sorted(tiers),
             "action": action,
+            "cluster_size": len(cluster),
         })
 
     # Sort: fix first, then by severity
-    sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
     triaged.sort(key=lambda t: (
         0 if t["action"] == "fix" else 1,
         sev_order.get(t["finding"]["severity"], 99),
@@ -434,7 +617,6 @@ def run_tests(test_cmd, workdir=None):
     """Run tests. Returns (success, output)."""
     if not test_cmd:
         return True, "(no tests configured)"
-
     try:
         result = subprocess.run(
             test_cmd, shell=True, capture_output=True, text=True,
@@ -448,26 +630,21 @@ def run_tests(test_cmd, workdir=None):
         return False, f"Test execution failed: {e}"
 
 
-# ─── Code Extraction from Coder Response ───────────────────
+# ─── Code Extraction ───────────────────────────────────────
 
 def extract_code_from_response(response, filename):
-    """Extract code blocks from coder response, keyed by filename."""
+    """Extract code blocks from coder response."""
     if not response:
         return None
 
-    # Look for fenced code blocks
-    # Try to find one that matches the filename
     blocks = re.findall(r'```(?:\w+)?\n(.*?)```', response, re.DOTALL)
-
     if not blocks:
         return None
 
-    # If only one code block, assume it's the fixed file
     if len(blocks) == 1:
         return blocks[0]
 
-    # If multiple, try to match by filename header
-    # Look for "### filename" or "# filename" before code blocks
+    # Try to match by filename header
     pattern = re.compile(
         r'(?:^|\n)#+\s*' + re.escape(filename) + r'.*?\n```(?:\w+)?\n(.*?)```',
         re.DOTALL
@@ -476,13 +653,12 @@ def extract_code_from_response(response, filename):
     if m:
         return m.group(1)
 
-    # Return the longest code block (likely the full file)
     return max(blocks, key=len)
 
 
 # ─── Report Generation ─────────────────────────────────────
 
-def generate_report(iteration, triaged, review_results, test_result, output_dir):
+def generate_report(iteration, triaged, review_results, test_result, storage, logger):
     """Generate a markdown report for this iteration."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [
@@ -501,16 +677,19 @@ def generate_report(iteration, triaged, review_results, test_result, output_dir)
 
     # Review summary
     lines.append("## Review Summary")
-    lines.append(f"| Model | Findings | Tier |")
-    lines.append(f"|-------|----------|------|")
+    lines.append("| Model | Findings | Tier |")
+    lines.append("|-------|----------|------|")
+    total_findings = 0
     for label, (findings, tier) in review_results.items():
         lines.append(f"| {label} | {len(findings)} | T{tier} |")
+        total_findings += len(findings)
     lines.append("")
 
     # Triaged findings
-    fix_count = sum(1 for t in triaged if t["action"] == "fix")
-    skip_count = sum(1 for t in triaged if t["action"] == "skip")
-    lines.append(f"## Triaged Findings: {fix_count} to fix, {skip_count} skipped")
+    fix_items = [t for t in triaged if t["action"] == "fix"]
+    skip_items = [t for t in triaged if t["action"] == "skip"]
+    lines.append(f"## Triaged: {len(fix_items)} to fix, {len(skip_items)} skipped "
+                 f"(from {total_findings} raw findings, {len(triaged)} unique)")
     lines.append("")
 
     for i, t in enumerate(triaged, 1):
@@ -519,19 +698,17 @@ def generate_report(iteration, triaged, review_results, test_result, output_dir)
         models_str = ", ".join(t["models"])
         lines.append(f"### {action_icon} {i}. [{f['severity']}] {f['title']}")
         lines.append(f"- **Location:** {f.get('location', '?')}")
-        lines.append(f"- **Models:** {models_str} ({t['n_models']} models)")
+        lines.append(f"- **Models:** {models_str} ({t['n_models']} model{'s' if t['n_models']>1 else ''})")
         lines.append(f"- **Action:** {t['action']}")
         if f.get("description"):
-            lines.append(f"- **Details:** {f['description'][:500]}")
+            desc = f['description'].strip()[:500]
+            lines.append(f"- **Details:** {desc}")
         if f.get("suggestion"):
             lines.append(f"- **Fix:** {f['suggestion'][:500]}")
         lines.append("")
 
     report = "\n".join(lines)
-
-    # Write to file
-    report_path = Path(output_dir) / f"iteration-{iteration:02d}.md"
-    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path = storage.run_dir / f"report-iter-{iteration:02d}.md"
     report_path.write_text(report)
 
     return report_path, report
@@ -548,14 +725,19 @@ def main():
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Config file")
     parser.add_argument("--test", default="", help="Test command (overrides config)")
     parser.add_argument("--standards", default="", help="Standards file for comparison")
-    parser.add_argument("--output", default="", help="Output directory (overrides config)")
-    parser.add_argument("--max-iter", type=int, default=0, help="Max iterations (overrides config)")
+    parser.add_argument("--output", default="", help="Output/runs directory")
+    parser.add_argument("--max-iter", type=int, default=0, help="Max iterations")
     parser.add_argument("--review-only", action="store_true", help="Review only, no fixes")
-    parser.add_argument("--coder-model", default="", help="Override coder model (provider/model)")
+    parser.add_argument("--coder-model", default="", help="Override coder (provider/model)")
     parser.add_argument("--skip-tier2", action="store_true", help="Skip Tier 2 reviewers")
     parser.add_argument("--skip-tier1", action="store_true", help="Skip Tier 1 reviewers")
-    parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    parser.add_argument("--verbose", action="store_true", default=True, help="Verbose output")
+    parser.add_argument("--quiet", action="store_true", help="Minimal output")
+    parser.add_argument("--version", action="version", version=f"neuron-loop {VERSION}")
     args = parser.parse_args()
+
+    if args.quiet:
+        args.verbose = False
 
     # Load config
     config = load_config(args.config) if Path(args.config).exists() else default_config()
@@ -567,25 +749,36 @@ def main():
         config["output"]["dir"] = args.output
     if args.max_iter:
         config["loop"]["max_iterations"] = args.max_iter
-    if args.verbose:
-        config["output"]["verbose"] = True
 
     output_dir = config["output"]["dir"]
-    verbose = config["output"]["verbose"]
+    verbose = args.verbose
     max_iter = config["loop"]["max_iterations"]
     convergence = config["loop"]["convergence_threshold"]
     test_cmd = config["test"]["command"]
 
-    # Load providers
-    providers = load_openclaw_providers()
-    client = ModelClient(providers)
-
-    # Load task context
+    # Load task
     task_path = Path(args.task)
     if not task_path.exists():
         print(f"[ERROR] Task file not found: {task_path}")
         sys.exit(1)
     task_context = task_path.read_text()
+    task_name = task_path.stem
+
+    # Initialize storage and logging
+    storage = RunStorage(output_dir, task_name)
+    logger = StructuredLogger(storage.run_dir, verbose=verbose)
+
+    logger.info(f"Neuron-Loop v{VERSION} starting")
+    logger.event("run_start", version=VERSION, task=str(task_path),
+                 files=[str(f) for f in args.files])
+
+    # Save config (without secrets)
+    storage.save_config(config)
+    storage.save_task(task_context)
+
+    # Load providers
+    providers = load_openclaw_providers()
+    client = ModelClient(providers, logger)
 
     # Load standards
     standards_text = ""
@@ -597,9 +790,10 @@ def main():
     for fp in args.files:
         p = Path(fp)
         if not p.exists():
-            print(f"[ERROR] File not found: {fp}")
+            logger.error(f"File not found: {fp}")
             sys.exit(1)
         files_content[p.name] = p.read_text()
+        storage.save_original_file(p.name, p.read_text())
 
     # Build reviewer list
     reviewers = []
@@ -611,7 +805,7 @@ def main():
             reviewers.append((r["provider"], r["model"], r["label"], 2))
 
     if not reviewers:
-        print("[ERROR] No reviewers configured")
+        logger.error("No reviewers configured")
         sys.exit(1)
 
     # Determine coder model
@@ -627,46 +821,52 @@ def main():
     print("=" * 60)
     print("  NEURON-LOOP — Code Review & Fix Orchestrator")
     print("=" * 60)
+    print(f"  Run:       {storage.run_dir.name}")
     print(f"  Task:      {task_path.name}")
     print(f"  Files:     {', '.join(files_content.keys())}")
     print(f"  Reviewers: {', '.join(r[2] for r in reviewers)}")
     print(f"  Coder:     {coder_provider}/{coder_model}")
     print(f"  Max iter:  {max_iter}")
     print(f"  Tests:     {'yes' if test_cmd else 'none'}")
+    print(f"  Output:    {storage.run_dir}")
     print("=" * 60)
     print()
 
+    # Track per-model stats across iterations
+    model_stats = {}  # label → {"total_findings": N, "api_calls": N, "errors": N}
+
+    iteration = 0
     for iteration in range(1, max_iter + 1):
         elapsed = time.time() - start_time
         if elapsed > config["loop"]["timeout_seconds"]:
-            print(f"\n[TIMEOUT] {config['loop']['timeout_seconds']}s exceeded. Stopping.")
+            logger.warn(f"Timeout ({config['loop']['timeout_seconds']}s) exceeded")
             break
 
+        logger.event("iteration_start", iteration=iteration)
+
         print(f"╔══════════════════════════════════════════════════╗")
-        print(f"║  Iteration {iteration}/{max_iter}                              ║")
+        print(f"║  Iteration {iteration}/{max_iter}{'':>38}║")
         print(f"╚══════════════════════════════════════════════════╝")
 
         # ── Step 1: Tests ──
         test_result = None
         if test_cmd and config["test"]["before_review"]:
-            print("\n📋 Running tests...")
+            logger.info("Running pre-review tests...")
             test_ok, test_out = run_tests(test_cmd)
             test_result = (test_ok, test_out)
+            storage.save_test_output(iteration, "pre", test_ok, test_out)
+            logger.event("test_run", iteration=iteration, phase="pre", passed=test_ok)
             if test_ok:
                 print("   ✅ Tests passed")
             else:
-                print(f"   ❌ Tests failed:\n{test_out[:500]}")
-                if not args.review_only:
-                    print("   Sending test failures to coder...")
-                    # TODO: send test failures to coder for fixing
-                    # For now, continue to review phase
+                print(f"   ❌ Tests failed")
 
         # ── Step 2: Review ──
-        print(f"\n🔍 Sending to {len(reviewers)} reviewers...")
+        logger.info(f"Sending to {len(reviewers)} reviewers...")
 
         review_prompt = build_review_prompt(files_content, task_context, standards_text)
         messages = [
-            {"role": "system", "content": "You are a senior code reviewer. Return findings as JSON."},
+            {"role": "system", "content": "You are a senior code reviewer. Return findings as JSON array."},
             {"role": "user", "content": review_prompt},
         ]
 
@@ -674,23 +874,38 @@ def main():
 
         def run_review(provider, model, label, tier):
             t0 = time.time()
-            if verbose:
-                print(f"   ⏳ {label} ({provider}/{model})...")
-            response = client.call(provider, model, messages, max_tokens=8192, timeout=300)
-            dt = time.time() - t0
-            if response:
+            logger.info(f"  → {label} ({provider}/{model})")
+
+            # Init stats
+            if label not in model_stats:
+                model_stats[label] = {"total_findings": 0, "api_calls": 0, "errors": 0,
+                                      "provider": provider, "model": model, "tier": tier}
+            model_stats[label]["api_calls"] += 1
+
+            try:
+                response, usage = client.call(provider, model, messages, max_tokens=8192, timeout=300)
+                dt = time.time() - t0
                 findings = extract_findings(response)
-                if verbose:
-                    print(f"   ✅ {label}: {len(findings)} findings ({dt:.1f}s)")
 
-                # Save raw response
-                raw_path = Path(output_dir) / f"iter-{iteration:02d}-{label}-raw.md"
-                raw_path.parent.mkdir(parents=True, exist_ok=True)
-                raw_path.write_text(response)
+                model_stats[label]["total_findings"] += len(findings)
 
+                logger.event("review_complete", iteration=iteration, label=label,
+                             provider=provider, model=model, tier=tier,
+                             findings_count=len(findings), elapsed_s=round(dt, 1),
+                             usage=usage)
+
+                # Save raw response and findings
+                storage.save_review(iteration, label, response, findings)
+
+                print(f"   ✅ {label}: {len(findings)} findings ({dt:.1f}s)")
                 return label, findings, tier
-            else:
-                print(f"   ❌ {label}: failed ({dt:.1f}s)")
+
+            except Exception as e:
+                dt = time.time() - t0
+                model_stats[label]["errors"] += 1
+                logger.error(f"Review failed: {label} — {e}", label=label, error=str(e))
+                storage.save_review(iteration, label, f"ERROR: {e}", [])
+                print(f"   ❌ {label}: {e} ({dt:.1f}s)")
                 return label, [], tier
 
         # Run reviewers in parallel
@@ -704,37 +919,41 @@ def main():
                 review_results[label] = (findings, tier)
 
         # ── Step 3: Triage ──
-        print("\n⚖️  Triaging findings...")
+        logger.info("Triaging findings...")
         triaged = deduplicate_findings(review_results, config["gate"])
+        storage.save_triage(iteration, triaged)
 
         fix_items = [t for t in triaged if t["action"] == "fix"]
         skip_items = [t for t in triaged if t["action"] == "skip"]
 
-        print(f"   🔧 Fix: {len(fix_items)}")
-        print(f"   ⏭️  Skip: {len(skip_items)}")
+        logger.event("triage_complete", iteration=iteration,
+                     total_unique=len(triaged), fix=len(fix_items), skip=len(skip_items))
 
+        print(f"\n   ⚖️  Triage: {len(fix_items)} fix, {len(skip_items)} skip")
         for t in fix_items:
             f = t["finding"]
             models_str = ", ".join(t["models"])
-            print(f"   [{f['severity']}] {f['title']} — found by: {models_str}")
+            print(f"   [{f['severity']}] {f['title']} — {models_str}")
 
         # ── Step 4: Report ──
         report_path, report = generate_report(
-            iteration, triaged, review_results, test_result, output_dir
+            iteration, triaged, review_results, test_result, storage, logger
         )
-        print(f"\n📄 Report: {report_path}")
+        logger.info(f"Report: {report_path}")
 
-        # ── Step 5: Check convergence ──
+        # ── Step 5: Convergence check ──
         if len(fix_items) <= convergence:
-            print(f"\n🎉 Converged! {len(fix_items)} findings ≤ threshold {convergence}")
+            logger.info(f"Converged: {len(fix_items)} findings ≤ threshold {convergence}")
+            print(f"\n🎉 Converged!")
             break
 
         if args.review_only:
+            logger.info("Review-only mode, stopping")
             print("\n📝 Review-only mode. Stopping.")
             break
 
         # ── Step 6: Fix ──
-        print(f"\n🔧 Sending {len(fix_items)} findings to coder ({coder_provider}/{coder_model})...")
+        logger.info(f"Sending {len(fix_items)} findings to coder...")
 
         findings_text = ""
         for i, t in enumerate(fix_items, 1):
@@ -746,69 +965,99 @@ def main():
                 findings_text += f"Suggested fix: {f['suggestion']}\n"
 
         fix_prompt = build_fix_prompt(files_content, findings_text, task_context)
+        storage.save_fix_request(iteration, fix_prompt)
+
         fix_messages = [
-            {"role": "system", "content": "You are a senior engineer. Fix the reported issues. Return the complete fixed file(s) in code blocks."},
+            {"role": "system", "content": "You are a senior engineer. Fix the reported issues. "
+             "Return the complete fixed file(s) in fenced code blocks."},
             {"role": "user", "content": fix_prompt},
         ]
 
-        fix_response = client.call(coder_provider, coder_model, fix_messages, max_tokens=16384, timeout=600)
+        try:
+            fix_response, fix_usage = client.call(
+                coder_provider, coder_model, fix_messages, max_tokens=16384, timeout=600
+            )
+            storage.save_fix_response(iteration, fix_response)
 
-        if fix_response:
-            # Save raw coder response
-            fix_path = Path(output_dir) / f"iter-{iteration:02d}-coder-response.md"
-            fix_path.write_text(fix_response)
+            logger.event("coder_complete", iteration=iteration,
+                         provider=coder_provider, model=coder_model, usage=fix_usage)
 
-            # Extract fixed code and update files
+            # Extract and apply fixed code
             files_updated = False
             for filename in list(files_content.keys()):
                 new_code = extract_code_from_response(fix_response, filename)
                 if new_code and len(new_code.strip()) > 100:
-                    # Sanity check: new code shouldn't be drastically shorter
                     old_len = len(files_content[filename])
                     new_len = len(new_code)
-                    if new_len >= old_len * 0.5:  # Allow up to 50% shrinkage
+                    if new_len >= old_len * 0.5:
                         files_content[filename] = new_code
                         files_updated = True
-                        print(f"   ✅ Updated {filename} ({old_len} → {new_len} chars)")
 
-                        # Write updated file back to disk
+                        # Save to storage and write back to disk
+                        storage.save_iteration_file(iteration, filename, new_code)
                         for fp in args.files:
                             if Path(fp).name == filename:
                                 Path(fp).write_text(new_code)
                                 break
+
+                        logger.info(f"Updated {filename} ({old_len} → {new_len} chars)")
+                        logger.event("file_updated", iteration=iteration, filename=filename,
+                                     old_size=old_len, new_size=new_len)
                     else:
-                        print(f"   ⚠️  {filename}: new code too short ({new_len} vs {old_len}), skipping")
+                        logger.warn(f"{filename}: new code too short ({new_len} vs {old_len})")
                 else:
-                    print(f"   ⚠️  Could not extract fixed code for {filename}")
+                    logger.warn(f"Could not extract fixed code for {filename}")
 
             if not files_updated:
-                print("   ❌ No files updated. Breaking loop.")
+                logger.warn("No files updated, breaking loop")
                 break
 
             # ── Step 7: Post-fix tests ──
             if test_cmd and config["test"]["after_fix"]:
-                print("\n📋 Running post-fix tests...")
+                logger.info("Running post-fix tests...")
                 test_ok, test_out = run_tests(test_cmd)
+                storage.save_test_output(iteration, "post", test_ok, test_out)
+                logger.event("test_run", iteration=iteration, phase="post", passed=test_ok)
                 if test_ok:
-                    print("   ✅ Tests still pass")
+                    print("   ✅ Post-fix tests pass")
                 else:
-                    print(f"   ❌ Tests broken after fix:\n{test_out[:500]}")
-                    print("   Reverting would go here (not yet implemented)")
-                    # TODO: revert and retry
-        else:
-            print("   ❌ Coder failed to respond. Breaking loop.")
+                    print(f"   ❌ Post-fix tests failed")
+                    logger.warn("Tests failed after fix", test_output=test_out[:500])
+
+        except Exception as e:
+            logger.error(f"Coder failed: {e}")
+            storage.save_fix_response(iteration, f"ERROR: {e}")
             break
 
         print()
 
     # ── Final Summary ──
     elapsed = time.time() - start_time
+    summary = {
+        "version": VERSION,
+        "task": str(task_path),
+        "files": list(files_content.keys()),
+        "iterations": iteration,
+        "elapsed_seconds": round(elapsed, 1),
+        "model_stats": model_stats,
+        "run_dir": str(storage.run_dir),
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    storage.save_summary(summary)
+    logger.event("run_complete", **summary)
+    logger.close()
+
     print()
     print("=" * 60)
     print(f"  NEURON-LOOP COMPLETE")
-    print(f"  Iterations: {iteration}")
-    print(f"  Elapsed:    {elapsed:.0f}s")
-    print(f"  Reports:    {output_dir}/")
+    print(f"  Iterations:  {iteration}")
+    print(f"  Elapsed:     {elapsed:.0f}s")
+    print(f"  Run dir:     {storage.run_dir}")
+    print()
+    print("  Model Stats:")
+    for label, stats in model_stats.items():
+        print(f"    {label}: {stats['total_findings']} findings, "
+              f"{stats['api_calls']} calls, {stats['errors']} errors")
     print("=" * 60)
 
 
