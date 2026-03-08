@@ -1,5 +1,6 @@
 # Neuron-Loop
 output*/
+runs/
 __pycache__/
 *.pyc
 
