@@ -7,9 +7,9 @@
 
 # ─── Model Tiers ────────────────────────────────────────────
 tiers:
-  # The model that writes fixes
+  # The model that writes fixes (use your strongest model)
   coder:
-    model: "anthropic/claude-sonnet-4-6"
+    model: "anthropic/claude-opus-4-6"
 
   # Tier 1: Deep reviewers (high quality, may cost money)
   # Run in parallel. Cross-referenced for confidence.

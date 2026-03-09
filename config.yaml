@@ -8,8 +8,8 @@
 
 tiers:
   coder:
-    # Model that writes and fixes code
-    model: "anthropic/claude-sonnet-4-6"
+    # Model that writes and fixes code (strongest model)
+    model: "anthropic/claude-opus-4-6"
     role: "coder"
 
   tier1:

@@ -34,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 SCRIPT_DIR = Path(__file__).parent
 DEFAULT_CONFIG = SCRIPT_DIR / "config.yaml"
 OPENCLAW_MODELS = Path.home() / ".openclaw/agents/main/agent/models.json"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # ─── Logging Setup ──────────────────────────────────────────
 
@@ -372,7 +372,7 @@ def default_config():
     """Return default configuration."""
     return {
         "tiers": {
-            "coder": {"model": "anthropic/claude-sonnet-4-6", "role": "coder"},
+            "coder": {"model": "anthropic/claude-opus-4-6", "role": "coder"},
             "tier1": [
                 {"provider": "anthropic", "model": "claude-sonnet-4-6", "label": "sonnet"},
                 {"provider": "openai", "model": "gpt-5.4", "label": "gpt54"},
@@ -771,6 +771,97 @@ def apply_search_replace(content, blocks, logger):
     return content, applied, failed
 
 
+# ─── Diff Generation ───────────────────────────────────────
+
+def generate_diff(old_content, new_content, filename="file"):
+    """Generate a unified diff between old and new content."""
+    import difflib
+    old_lines = old_content.splitlines(keepends=True)
+    new_lines = new_content.splitlines(keepends=True)
+    diff = difflib.unified_diff(old_lines, new_lines,
+                                fromfile=f"a/{filename}", tofile=f"b/{filename}")
+    return "".join(diff)
+
+
+def build_verify_prompt(diff_text, findings_text, context=""):
+    """Build the verification prompt for diff review."""
+    template = load_prompt_template("verifier")
+    if not template:
+        template = ("Verify these code changes are correct.\n\n"
+                    "Diff:\n{diff}\n\nFindings addressed:\n{findings}")
+
+    result = template
+    result = result.replace("{diff}", diff_text)
+    result = result.replace("{findings}", findings_text)
+    result = result.replace("{context}", context or "Verify the fix is correct.")
+    return result
+
+
+def run_diff_verification(client, verifier, diff_text, findings_text, task_context,
+                          iteration, storage, logger, model_stats):
+    """Run diff verification with the alternate T1 model.
+
+    Returns list of BAD verdicts (empty = all good).
+    """
+    prov, model, label, tier = verifier
+    logger.info(f"🔍 Diff verification by {label} ({prov}/{model})...")
+
+    if label not in model_stats:
+        model_stats[label] = {"total_findings": 0, "api_calls": 0, "errors": 0,
+                              "provider": prov, "model": model, "tier": tier}
+    model_stats[label]["api_calls"] += 1
+
+    verify_prompt = build_verify_prompt(diff_text, findings_text, task_context)
+    messages = [
+        {"role": "system", "content": "You are a senior engineer verifying code changes. "
+         "Return verdicts as JSON array. Empty array [] means all changes are correct."},
+        {"role": "user", "content": verify_prompt},
+    ]
+
+    t0 = time.time()
+    try:
+        response, usage = client.call(prov, model, messages, max_tokens=4096, timeout=180)
+        dt = time.time() - t0
+
+        logger.event("verify_complete", iteration=iteration, label=label,
+                     elapsed_s=round(dt, 1), usage=usage)
+
+        # Save verification response
+        verify_dir = storage.run_dir / "verification"
+        verify_dir.mkdir(parents=True, exist_ok=True)
+        (verify_dir / f"iter-{iteration:02d}-{label}.md").write_text(response or "")
+
+        # Parse verdicts
+        bad_verdicts = []
+        if response:
+            # Try JSON extraction
+            json_match = re.search(r'\[[\s\S]*?\]', response)
+            if json_match:
+                try:
+                    verdicts = json.loads(json_match.group())
+                    if isinstance(verdicts, list):
+                        bad_verdicts = [v for v in verdicts
+                                        if isinstance(v, dict) and v.get("verdict") == "BAD"]
+                except json.JSONDecodeError:
+                    pass
+
+        if bad_verdicts:
+            print(f"   ⚠️  {label}: {len(bad_verdicts)} BAD verdict(s) ({dt:.1f}s)")
+            for v in bad_verdicts:
+                print(f"      → {v.get('issue', 'unknown issue')}")
+        else:
+            print(f"   ✅ {label}: changes verified ({dt:.1f}s)")
+
+        return bad_verdicts
+
+    except Exception as e:
+        dt = time.time() - t0
+        model_stats[label]["errors"] += 1
+        logger.error(f"Verification failed: {label} — {e}")
+        print(f"   ❌ {label}: verification failed ({dt:.1f}s)")
+        return []  # Don't block on verification failure
+
+
 # ─── Report Generation ─────────────────────────────────────
 
 def generate_report(iteration, triaged, review_results, test_result, storage, logger):
@@ -939,7 +1030,11 @@ def main():
     print(f"  Run:       {storage.run_dir.name}")
     print(f"  Task:      {task_path.name}")
     print(f"  Files:     {', '.join(files_content.keys())}")
-    print(f"  Reviewers: {', '.join(r[2] for r in reviewers)}")
+    t1_labels = [r[2] for r in reviewers if r[3] == 1]
+    t2_labels = [r[2] for r in reviewers if r[3] == 2]
+    print(f"  T1 Review: {' ↔ '.join(t1_labels)} (alternating)")
+    if t2_labels:
+        print(f"  T2 Sweep:  {', '.join(t2_labels)}")
     print(f"  Coder:     {coder_provider}/{coder_model}")
     print(f"  Max iter:  {max_iter}")
     print(f"  Tests:     {'yes' if test_cmd else 'none'}")
@@ -983,7 +1078,27 @@ def main():
                 print(f"   ❌ Tests failed")
 
         # ── Step 2: Review ──
-        logger.info(f"Sending to {len(reviewers)} reviewers...")
+        # Alternate T1 reviewers: odd iterations use first T1, even use second
+        # T2 reviewers always run (they're cheap/free)
+        iter_reviewers = []
+        t1_list = [r for r in reviewers if r[3] == 1]
+        t2_list = [r for r in reviewers if r[3] == 2]
+
+        if t1_list:
+            # Alternate: pick one T1 reviewer per iteration
+            t1_idx = (iteration - 1) % len(t1_list)
+            active_t1 = t1_list[t1_idx]
+            iter_reviewers.append(active_t1)
+            # The OTHER T1 reviewer will verify the diff later
+            verifier_t1 = t1_list[(t1_idx + 1) % len(t1_list)] if len(t1_list) > 1 else None
+        else:
+            verifier_t1 = None
+
+        iter_reviewers.extend(t2_list)
+
+        logger.info(f"Sending to {len(iter_reviewers)} reviewer(s) "
+                     f"(T1: {active_t1[2] if t1_list else 'none'}"
+                     f"{', verifier: ' + verifier_t1[2] if verifier_t1 else ''})...")
 
         review_prompt = build_review_prompt(files_content, task_context, standards_text)
         messages = [
@@ -1030,10 +1145,10 @@ def main():
                 return label, [], tier
 
         # Run reviewers in parallel
-        with ThreadPoolExecutor(max_workers=len(reviewers)) as pool:
+        with ThreadPoolExecutor(max_workers=len(iter_reviewers)) as pool:
             futures = {
                 pool.submit(run_review, prov, model, label, tier): label
-                for prov, model, label, tier in reviewers
+                for prov, model, label, tier in iter_reviewers
             }
             for future in as_completed(futures):
                 label, findings, tier = future.result()
@@ -1191,7 +1306,40 @@ def main():
                     logger.warn("No files updated, breaking loop")
                     break
 
-            # ── Step 7: Post-fix tests ──
+            # ── Step 7: Diff verification ──
+            if verifier_t1 and files_updated:
+                # Generate diff between pre-fix and post-fix content
+                for filename in list(files_content.keys()):
+                    pre_fix = last_good_files.get(filename, "")
+                    post_fix = files_content[filename]
+                    if pre_fix != post_fix:
+                        diff_text = generate_diff(pre_fix, post_fix, filename)
+                        if diff_text:
+                            bad_verdicts = run_diff_verification(
+                                client, verifier_t1, diff_text, findings_text,
+                                task_context, iteration, storage, logger, model_stats
+                            )
+                            if bad_verdicts:
+                                logger.warn(f"Verifier found {len(bad_verdicts)} bad fix(es), reverting")
+                                # Revert to pre-fix state
+                                files_content = {name: content for name, content in last_good_files.items()}
+                                for fn, content in files_content.items():
+                                    for fp in args.files:
+                                        if Path(fp).name == fn:
+                                            Path(fp).write_text(content)
+                                            break
+                                logger.event("revert", iteration=iteration,
+                                             reason="verifier rejected fixes",
+                                             bad_verdicts=len(bad_verdicts))
+                                files_updated = False
+                                break
+
+            if not files_updated:
+                # Was reverted by verifier — skip tests, continue to next iteration
+                print("   🔄 Reverted by verifier, continuing...")
+                continue
+
+            # ── Step 8: Post-fix tests ──
             if test_cmd and config["test"]["after_fix"]:
                 logger.info("Running post-fix tests...")
                 test_ok, test_out = run_tests(test_cmd)
