@@ -56,10 +56,9 @@ When reviewing and improving these scripts, focus on:
 - Implementing missing required features from the list above
 - Consistency across all collectors (same flags, same behavior, same exit codes)
 
-## What NOT to do
+## Constraints
 
-- Do NOT rewrite entire scripts — make targeted improvements
-- Do NOT change the CLI interface (flag names, defaults) unless fixing a bug
-- Do NOT attempt to add features listed under "Allowed limitations"
-- Do NOT add external dependencies (all scripts must remain stdlib/single-file)
-- Preserve the script's style and structure where possible
+- Do NOT attempt to add features listed under "Allowed limitations" for each platform
+- Do NOT change the CLI interface (flag names, parameter defaults) unless fixing a bug
+- Do NOT add external dependencies — all scripts must work with only their documented requirements (e.g. curl/wget for shell, stdlib for Python, LWP for Perl)
+- Refactoring and restructuring is fine — adding functions, improving flow, extracting helpers — as long as the script's behavior and interface remain compatible
