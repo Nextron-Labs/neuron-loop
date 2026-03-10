@@ -199,6 +199,30 @@ class RunStorage:
     def save_summary(self, summary):
         (self.run_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
 
+    def save_checkpoint(self, iteration, files_content, model_stats, addressed_fingerprints,
+                        last_good_files):
+        """Save checkpoint state for resume capability."""
+        checkpoint = {
+            "version": VERSION,
+            "iteration": iteration,
+            "files_content": files_content,
+            "last_good_files": last_good_files,
+            "model_stats": {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")}
+                           for k, v in model_stats.items()},
+            "addressed_fingerprints": list(addressed_fingerprints),
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        }
+        (self.run_dir / "checkpoint.json").write_text(
+            json.dumps(checkpoint, indent=2, default=str))
+
+    @staticmethod
+    def load_checkpoint(run_dir):
+        """Load checkpoint from a previous run directory."""
+        cp_path = Path(run_dir) / "checkpoint.json"
+        if not cp_path.exists():
+            return None
+        return json.loads(cp_path.read_text())
+
 
 # ─── Provider API Clients ──────────────────────────────────
 
@@ -216,13 +240,18 @@ def api_call_openai_compat(base_url, api_key, model, messages, max_tokens=8192, 
     """Call an OpenAI-compatible API (OpenAI, xAI, Ollama Cloud, OpenRouter)."""
     url = f"{base_url.rstrip('/')}/chat/completions"
     is_openai = "api.openai.com" in base_url
+    is_ollama_cloud = "ollama.com" in base_url
     token_key = "max_completion_tokens" if is_openai else "max_tokens"
-    body = json.dumps({
+    payload = {
         "model": model,
         "messages": messages,
         token_key: max_tokens,
         "temperature": 0.2,
-    }).encode("utf-8")
+    }
+    # Disable thinking for Ollama Cloud qwen models (content comes back empty otherwise)
+    if is_ollama_cloud:
+        payload["reasoning_effort"] = "none"
+    body = json.dumps(payload).encode("utf-8")
 
     headers = {
         "Content-Type": "application/json",
@@ -972,6 +1001,7 @@ def main():
     parser.add_argument("--coder-model", default="", help="Override coder (provider/model)")
     parser.add_argument("--skip-tier2", action="store_true", help="Skip Tier 2 reviewers")
     parser.add_argument("--skip-tier1", action="store_true", help="Skip Tier 1 reviewers")
+    parser.add_argument("--resume", default="", help="Resume from a previous run directory")
     parser.add_argument("--verbose", action="store_true", default=True, help="Verbose output")
     parser.add_argument("--quiet", action="store_true", help="Minimal output")
     parser.add_argument("--version", action="version", version=f"neuron-loop {VERSION}")
@@ -1086,11 +1116,42 @@ def main():
     # Track last known good state for revert-on-test-failure
     last_good_files = {name: content for name, content in files_content.items()}
 
+    # Resume from checkpoint if requested
+    start_iteration = 1
+    if args.resume:
+        checkpoint = RunStorage.load_checkpoint(args.resume)
+        if checkpoint:
+            start_iteration = checkpoint["iteration"] + 1
+            files_content = checkpoint["files_content"]
+            last_good_files = checkpoint.get("last_good_files", dict(files_content))
+            model_stats = checkpoint.get("model_stats", {})
+            addressed_fingerprints = set(checkpoint.get("addressed_fingerprints", []))
+
+            # Write resumed files to disk so the coder works on the right state
+            for filename, content in files_content.items():
+                for fp in args.files:
+                    if Path(fp).name == filename:
+                        Path(fp).write_text(content)
+                        break
+
+            logger.info(f"Resumed from {args.resume} at iteration {start_iteration}")
+            print(f"\n  ♻️  Resuming from iteration {start_iteration} "
+                  f"(checkpoint: {args.resume})")
+            print()
+        else:
+            logger.error(f"No checkpoint found in {args.resume}")
+            print(f"[ERROR] No checkpoint.json in {args.resume}")
+            sys.exit(1)
+
     iteration = 0
-    for iteration in range(1, max_iter + 1):
+    for iteration in range(start_iteration, max_iter + 1):
         elapsed = time.time() - start_time
         if elapsed > config["loop"]["timeout_seconds"]:
             logger.warn(f"Timeout ({config['loop']['timeout_seconds']}s) exceeded")
+            storage.save_checkpoint(iteration - 1, files_content, model_stats,
+                                    addressed_fingerprints, last_good_files)
+            logger.info(f"Checkpoint saved at iteration {iteration - 1} (timeout)")
+            print(f"\n   💾 Checkpoint saved — resume with: --resume {storage.run_dir}")
             break
 
         logger.event("iteration_start", iteration=iteration)
@@ -1444,7 +1505,16 @@ def main():
         except Exception as e:
             logger.error(f"Coder failed: {e}")
             storage.save_fix_response(iteration, f"ERROR: {e}")
+            # Save checkpoint before halting so we can resume
+            storage.save_checkpoint(iteration, files_content, model_stats,
+                                    addressed_fingerprints, last_good_files)
+            logger.info(f"Checkpoint saved at iteration {iteration} (coder failed)")
+            print(f"\n   💾 Checkpoint saved — resume with: --resume {storage.run_dir}")
             break
+
+        # Save checkpoint after each successful iteration
+        storage.save_checkpoint(iteration, files_content, model_stats,
+                                addressed_fingerprints, last_good_files)
 
         print()
 
