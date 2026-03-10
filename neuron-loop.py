@@ -1585,6 +1585,9 @@ def main():
                 print("   🔄 Reverted by verifier, continuing...")
                 continue
 
+            # Verification passed — update last known good state
+            last_good_files = {name: content for name, content in files_content.items()}
+
             # ── Step 8: Post-fix tests ──
             if test_cmd and config["test"]["after_fix"]:
                 logger.info("Running post-fix tests...")
