@@ -26,13 +26,6 @@ tiers:
     - provider: ollama-cloud
       model: "glm-5:cloud"
       label: "glm5"
-    - provider: openrouter
-      model: "auto"
-      label: "openrouter"
-    # Uncomment to add more:
-    # - provider: xai
-    #   model: "grok-4-1-fast-reasoning"
-    #   label: "grok"
 
 # ─── Gate Rules ─────────────────────────────────────────────
 # How to triage findings across models
