@@ -227,6 +227,7 @@ def api_call_openai_compat(base_url, api_key, model, messages, max_tokens=8192, 
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
+        "User-Agent": f"neuron-loop/{VERSION}",
     }
 
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
@@ -856,6 +857,40 @@ def run_diff_verification(client, verifier, diff_text, findings_text, task_conte
 
     except Exception as e:
         dt = time.time() - t0
+        # Retry once for transient errors
+        retry_codes = ("401", "403", "429", "timeout", "Connection")
+        if any(code in str(e) for code in retry_codes):
+            logger.warn(f"Verification failed (retrying in 5s): {label} — {e}")
+            print(f"   ⚠️  {label}: verification failed — retrying in 5s...")
+            time.sleep(5)
+            try:
+                t1 = time.time()
+                response, usage = client.call(prov, model, messages, max_tokens=4096, timeout=180)
+                dt2 = time.time() - t1
+                model_stats[label]["api_calls"] += 1
+                verify_dir = storage.run_dir / "verification"
+                verify_dir.mkdir(parents=True, exist_ok=True)
+                (verify_dir / f"iter-{iteration:02d}-{label}.md").write_text(response or "")
+                bad_verdicts = []
+                if response:
+                    json_match = re.search(r'\[[\s\S]*?\]', response)
+                    if json_match:
+                        try:
+                            verdicts = json.loads(json_match.group())
+                            if isinstance(verdicts, list):
+                                bad_verdicts = [v for v in verdicts
+                                                if isinstance(v, dict) and v.get("verdict") == "BAD"]
+                        except json.JSONDecodeError:
+                            pass
+                if bad_verdicts:
+                    print(f"   ⚠️  {label}: {len(bad_verdicts)} BAD verdict(s) ({dt2:.1f}s, retry)")
+                else:
+                    print(f"   ✅ {label}: changes verified ({dt2:.1f}s, retry)")
+                return bad_verdicts
+            except Exception as e2:
+                logger.error(f"Verification retry failed: {label} — {e2}")
+                print(f"   ❌ {label}: retry failed ({time.time()-t1:.1f}s)")
+
         model_stats[label]["errors"] += 1
         logger.error(f"Verification failed: {label} — {e}")
         print(f"   ❌ {label}: verification failed ({dt:.1f}s)")
@@ -1138,6 +1173,27 @@ def main():
 
             except Exception as e:
                 dt = time.time() - t0
+                # Retry once after 5s for transient errors (401, 403, 429, timeouts)
+                retry_codes = ("401", "403", "429", "timeout", "Connection")
+                if any(code in str(e) for code in retry_codes):
+                    logger.warn(f"Review failed (retrying in 5s): {label} — {e}")
+                    print(f"   ⚠️  {label}: {e} — retrying in 5s...")
+                    time.sleep(5)
+                    try:
+                        t1 = time.time()
+                        response, usage = client.call(prov, model, messages, max_tokens=8192, timeout=300)
+                        dt2 = time.time() - t1
+                        findings = parse_review_response(response, label)
+                        model_stats[label]["api_calls"] += 1
+                        model_stats[label]["total_findings"] += len(findings)
+                        storage.save_review(iteration, label, response, findings)
+                        print(f"   ✅ {label}: {len(findings)} findings ({dt2:.1f}s, retry)")
+                        return label, findings, tier
+                    except Exception as e2:
+                        dt2 = time.time() - t1
+                        logger.error(f"Review retry failed: {label} — {e2}")
+                        print(f"   ❌ {label}: retry failed — {e2} ({dt2:.1f}s)")
+
                 model_stats[label]["errors"] += 1
                 logger.error(f"Review failed: {label} — {e}", label=label, error=str(e))
                 storage.save_review(iteration, label, f"ERROR: {e}", [])
@@ -1180,6 +1236,26 @@ def main():
         logger.info(f"Report: {report_path}")
 
         # ── Step 5: Convergence check ──
+        # Don't converge if any T1 reviewer failed this iteration
+        t1_failed = any(
+            model_stats[label]["errors"] > 0 and tier == 1
+            for label, (findings, tier) in review_results.items()
+            if model_stats[label]["errors"] > (model_stats[label].get("_prev_errors", 0))
+        )
+        if t1_failed:
+            # Update prev_errors tracking
+            for label in model_stats:
+                model_stats[label]["_prev_errors"] = model_stats[label]["errors"]
+            if len(fix_items) <= convergence:
+                logger.warn(f"Would converge ({len(fix_items)} findings) but T1 reviewer failed — "
+                             "not trustworthy, continuing")
+                print(f"\n⚠️  T1 reviewer failed this iteration — skipping convergence check")
+                continue
+
+        # Update prev_errors tracking
+        for label in model_stats:
+            model_stats[label]["_prev_errors"] = model_stats[label]["errors"]
+
         if len(fix_items) <= convergence:
             logger.info(f"Converged: {len(fix_items)} findings ≤ threshold {convergence}")
             print(f"\n🎉 Converged!")
