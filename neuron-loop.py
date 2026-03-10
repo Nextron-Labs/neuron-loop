@@ -480,6 +480,39 @@ def build_fix_prompt(files_content, findings_text, context=""):
     return result
 
 
+def build_improve_prompt(files_content, context=""):
+    """Build the improve prompt — coder reviews and improves the script itself."""
+    template = load_prompt_template("improver")
+    if not template:
+        template = """Review and improve the following script. You are both reviewer and coder.
+
+## Task Context
+{context}
+
+## Instructions
+1. Carefully review the script for bugs, security issues, edge cases, and correctness
+2. Produce an improved version using SEARCH/REPLACE blocks
+3. Focus on: logic errors, security vulnerabilities, error handling, edge cases, platform compatibility
+4. Do NOT rewrite the entire script — make targeted improvements
+5. Do NOT change the script's interface (CLI flags, exit codes) unless fixing a bug
+6. Preserve the script's style and structure where possible
+
+## Current Script
+{code}
+
+Return ONLY SEARCH/REPLACE blocks using <<<SEARCH, >>>REPLACE, <<<END delimiters.
+Label each fix with a brief comment (e.g. ### Fix 1: description)."""
+
+    code = ""
+    for name, content in files_content.items():
+        code += f"\n### {name}\n```\n{content}\n```\n"
+
+    result = template
+    result = result.replace("{code}", code)
+    result = result.replace("{context}", context or "Review and improve this script.")
+    return result
+
+
 # ─── Finding Extraction ────────────────────────────────────
 
 def extract_findings(response_text):
@@ -998,6 +1031,8 @@ def main():
     parser.add_argument("--output", default="", help="Output/runs directory")
     parser.add_argument("--max-iter", type=int, default=0, help="Max iterations")
     parser.add_argument("--review-only", action="store_true", help="Review only, no fixes")
+    parser.add_argument("--mode", choices=["review-fix", "improve"], default="review-fix",
+                        help="Mode: review-fix (reviewers find, coder fixes) or improve (coder improves, reviewers verify)")
     parser.add_argument("--coder-model", default="", help="Override coder (provider/model)")
     parser.add_argument("--skip-tier2", action="store_true", help="Skip Tier 2 reviewers")
     parser.add_argument("--skip-tier1", action="store_true", help="Skip Tier 1 reviewers")
@@ -1101,6 +1136,7 @@ def main():
     if t2_labels:
         print(f"  T2 Sweep:  {', '.join(t2_labels)}")
     print(f"  Coder:     {coder_provider}/{coder_model}")
+    print(f"  Mode:      {args.mode}")
     print(f"  Max iter:  {max_iter}")
     print(f"  Tests:     {'yes' if test_cmd else 'none'}")
     print(f"  Output:    {storage.run_dir}")
@@ -1172,6 +1208,79 @@ def main():
                 print("   ✅ Tests passed")
             else:
                 print(f"   ❌ Tests failed")
+
+        # ── Improve mode: iteration 1 → coder improves, skip review ──
+        if args.mode == "improve" and iteration == start_iteration:
+            logger.info("Improve mode: sending script to coder for initial review & improvement...")
+            print("   🔧 Improve mode — coder reviews and improves the script\n")
+
+            improve_prompt = build_improve_prompt(files_content, task_context)
+            improve_messages = [
+                {"role": "system", "content": "You are a senior engineer. Review and improve the script. "
+                 "Return ONLY SEARCH/REPLACE blocks using <<<SEARCH, >>>REPLACE, <<<END delimiters. "
+                 "Do NOT return the entire file."},
+                {"role": "user", "content": improve_prompt},
+            ]
+
+            try:
+                fix_response, fix_usage = client.call(
+                    coder_provider, coder_model, improve_messages, max_tokens=16384, timeout=600
+                )
+                storage.save_fix_request(iteration, improve_prompt)
+                storage.save_fix_response(iteration, fix_response)
+
+                logger.event("improve_complete", iteration=iteration,
+                             provider=coder_provider, model=coder_model, usage=fix_usage)
+
+                blocks = parse_search_replace_blocks(fix_response)
+                if blocks:
+                    logger.info(f"Parsed {len(blocks)} SEARCH/REPLACE blocks from improver")
+                    files_updated = False
+                    for filename in list(files_content.keys()):
+                        old_content = files_content[filename]
+                        new_content, applied, failed = apply_search_replace(
+                            old_content, blocks, logger
+                        )
+                        if applied > 0:
+                            files_content[filename] = new_content
+                            files_updated = True
+                            storage.save_iteration_file(iteration, filename, new_content)
+                            for fp in args.files:
+                                if Path(fp).name == filename:
+                                    Path(fp).write_text(new_content)
+                                    break
+                            old_lines = old_content.count('\n') + 1
+                            new_lines = new_content.count('\n') + 1
+                            logger.info(f"Improved {filename}: {applied} applied, {failed} failed "
+                                        f"({old_lines} → {new_lines} lines)")
+                            print(f"   ✅ {filename}: {applied} improvements applied "
+                                  f"({old_lines} → {new_lines} lines)")
+                        else:
+                            logger.warn(f"No improvements applied to {filename} ({failed} failed)")
+                            print(f"   ❌ No improvements applied to {filename}")
+
+                    if files_updated:
+                        last_good_files = {name: content for name, content in files_content.items()}
+                        storage.save_checkpoint(iteration, files_content, model_stats,
+                                                addressed_fingerprints, last_good_files)
+                        print()
+                        continue  # → next iteration (reviewers will verify)
+                    else:
+                        logger.warn("Coder produced no applicable improvements, breaking")
+                        print("   ⚠️  No improvements could be applied")
+                        break
+                else:
+                    logger.warn("No SEARCH/REPLACE blocks found in improve response")
+                    print("   ⚠️  Coder returned no SEARCH/REPLACE blocks")
+                    break
+
+            except Exception as e:
+                logger.error(f"Improve step failed: {e}")
+                storage.save_fix_response(iteration, f"ERROR: {e}")
+                storage.save_checkpoint(iteration, files_content, model_stats,
+                                        addressed_fingerprints, last_good_files)
+                print(f"\n   💾 Checkpoint saved — resume with: --resume {storage.run_dir}")
+                break
 
         # ── Step 2: Review ──
         # Alternate T1 reviewers: odd iterations use first T1, even use second
