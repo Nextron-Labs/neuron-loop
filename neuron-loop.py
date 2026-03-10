@@ -747,9 +747,9 @@ def parse_search_replace_blocks(response):
 
     blocks = []
 
-    # Pattern: <<<SEARCH ... >>>REPLACE ... <<<END
+    # Pattern: <<<SEARCH ... >>>REPLACE ... <<<END (also accept >>>END)
     pattern = re.compile(
-        r'<<<SEARCH\s*\n(.*?)>>>REPLACE\s*\n(.*?)<<<END',
+        r'<<<SEARCH\s*\n(.*?)>>>REPLACE\s*\n(.*?)(?:<<<END|>>>END)',
         re.DOTALL
     )
 
@@ -776,7 +776,7 @@ def parse_search_replace_blocks(response):
 def sanitize_replacement(text):
     """Strip stray SEARCH/REPLACE format markers from replacement text.
     These can leak when the coder echoes its own format into code."""
-    markers = ['<<<SEARCH', '>>>REPLACE', '<<<END']
+    markers = ['<<<SEARCH', '>>>REPLACE', '<<<END', '>>>END']
     for marker in markers:
         text = text.replace(marker, '')
     return text
