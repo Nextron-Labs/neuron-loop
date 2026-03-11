@@ -1615,6 +1615,47 @@ def main():
                     logger.event("revert", iteration=iteration, reason="post-fix tests failed")
 
         except Exception as e:
+            # Retry once for transient errors (401, 403, 429, timeouts)
+            retry_codes = ("401", "403", "429", "timeout", "Connection")
+            if any(code in str(e) for code in retry_codes):
+                logger.warn(f"Coder failed (retrying in 10s): {e}")
+                print(f"   ⚠️  Coder failed — retrying in 10s...")
+                time.sleep(10)
+                try:
+                    fix_response, fix_usage = client.call(
+                        coder_provider, coder_model, fix_messages, max_tokens=16384, timeout=600
+                    )
+                    storage.save_fix_response(iteration, fix_response)
+                    blocks = parse_search_replace_blocks(fix_response)
+                    if blocks:
+                        files_updated = False
+                        for filename in list(files_content.keys()):
+                            old_content = files_content[filename]
+                            new_content, applied, failed = apply_search_replace(
+                                old_content, blocks, logger
+                            )
+                            if applied > 0:
+                                files_content[filename] = new_content
+                                files_updated = True
+                                storage.save_iteration_file(iteration, filename, new_content)
+                                for fp in args.files:
+                                    if Path(fp).name == filename:
+                                        Path(fp).write_text(new_content)
+                                        break
+                                old_lines = old_content.count('\n') + 1
+                                new_lines = new_content.count('\n') + 1
+                                print(f"   ✅ {filename}: {applied} applied, {failed} failed "
+                                      f"({old_lines} → {new_lines} lines) [retry]")
+                        if files_updated:
+                            last_good_files = {name: content for name, content in files_content.items()}
+                            storage.save_checkpoint(iteration, files_content, model_stats,
+                                                    addressed_fingerprints, last_good_files)
+                            print()
+                            continue
+                except Exception as e2:
+                    logger.error(f"Coder retry failed: {e2}")
+                    print(f"   ❌ Coder retry failed: {e2}")
+
             logger.error(f"Coder failed: {e}")
             storage.save_fix_response(iteration, f"ERROR: {e}")
             # Save checkpoint before halting so we can resume
