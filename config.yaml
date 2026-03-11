@@ -14,7 +14,7 @@ tiers:
 
   tier1:
     # Deep reviewers — run in parallel, cross-reference findings
-    - provider: anthropic
+    - provider: anthropic-reviewer
       model: "claude-sonnet-4-6"
       label: "sonnet"
     - provider: openai
