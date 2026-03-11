@@ -418,7 +418,7 @@ def default_config():
             "tier2_single_action": "skip_unless_critical",
         },
         "loop": {
-            "max_iterations": 10,
+            "max_iterations": 15,
             "max_coder_rounds": 20,
             "convergence_threshold": 0,
             "timeout_seconds": 3600,
@@ -1426,9 +1426,20 @@ def main():
         for label in model_stats:
             model_stats[label]["_prev_errors"] = model_stats[label]["errors"]
 
-        if len(fix_items) <= convergence:
-            logger.info(f"Converged: {len(fix_items)} findings ≤ threshold {convergence}")
-            print(f"\n🎉 Converged!")
+        # Severity-aware convergence: only MEDIUM+ findings count
+        min_severity = config.get("loop", {}).get("min_fix_severity", "LOW").upper()
+        sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        min_rank = sev_rank.get(min_severity, 3)
+        significant_fixes = [t for t in fix_items
+                             if sev_rank.get(t["finding"]["severity"], 3) <= min_rank]
+
+        if len(significant_fixes) <= convergence:
+            if fix_items and not significant_fixes:
+                logger.info(f"Converged: {len(fix_items)} remaining findings are all below {min_severity} — stopping")
+                print(f"\n🎉 Converged! Only minor ({min_severity.lower()}-excluded) findings remain.")
+            else:
+                logger.info(f"Converged: {len(significant_fixes)} significant findings ≤ threshold {convergence}")
+                print(f"\n🎉 Converged!")
             break
 
         if args.review_only:

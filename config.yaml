@@ -39,9 +39,10 @@ gate:
 
 # ─── Loop Limits ────────────────────────────────────────────
 loop:
-  max_iterations: 10       # Hard stop
+  max_iterations: 15       # Hard stop
   max_coder_rounds: 20     # Max rounds per coder session
-  convergence_threshold: 0 # Stop when this many or fewer findings remain
+  convergence_threshold: 0 # Stop when this many or fewer significant findings remain
+  min_fix_severity: "MEDIUM" # Only MEDIUM+ must be fixed; LOW findings don't block convergence
   timeout_seconds: 3600    # Overall timeout
 
 # ─── Test Configuration ────────────────────────────────────
