@@ -9,7 +9,7 @@
 tiers:
   coder:
     # Model that writes and fixes code (strongest model)
-    model: "anthropic/claude-opus-4-6"
+    model: "anthropic-coder/claude-opus-4-6"
     role: "coder"
 
   tier1:
