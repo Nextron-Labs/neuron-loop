@@ -34,13 +34,157 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 SCRIPT_DIR = Path(__file__).parent
 DEFAULT_CONFIG = SCRIPT_DIR / "config.yaml"
 OPENCLAW_MODELS = Path.home() / ".openclaw/agents/main/agent/models.json"
-VERSION = "0.5.0"
+VERSION = "0.6.0"
+
+# ─── Pricing (per million tokens) ──────────────────────────
+# Source: provider pricing pages as of 2026-03.
+# Models not listed here are treated as $0 (local/free).
+MODEL_PRICING = {
+    # Anthropic
+    "claude-opus-4-6":    {"input": 15.0,  "output": 75.0},
+    "claude-opus-4-5":    {"input": 15.0,  "output": 75.0},
+    "claude-sonnet-4-6":  {"input": 3.0,   "output": 15.0},
+    "claude-sonnet-4-5":  {"input": 3.0,   "output": 15.0},
+    # OpenAI
+    "gpt-5.4":            {"input": 2.50,  "output": 10.0},
+    "gpt-5-mini":         {"input": 0.40,  "output": 1.60},
+    # Free/local
+    "glm-5:cloud":        {"input": 0.0,   "output": 0.0},
+}
 
 # ─── Logging Setup ──────────────────────────────────────────
 
 import urllib.request
 import urllib.error
 import ssl
+
+
+class CostTracker:
+    """Track token usage and estimated costs per iteration and role."""
+
+    def __init__(self):
+        self.iterations = {}  # iter_num → {role → {model, input_tokens, output_tokens, calls, cost}}
+        self.totals = {}      # model → {input_tokens, output_tokens, calls, cost}
+
+    def _get_pricing(self, model):
+        """Look up pricing for a model name (tries exact match then suffix)."""
+        if model in MODEL_PRICING:
+            return MODEL_PRICING[model]
+        # Try matching just the model name (strip provider prefix)
+        base = model.split("/")[-1] if "/" in model else model
+        if base in MODEL_PRICING:
+            return MODEL_PRICING[base]
+        return {"input": 0.0, "output": 0.0}
+
+    def record(self, iteration, role, model, usage):
+        """Record token usage for one API call.
+
+        Args:
+            iteration: iteration number
+            role: "reviewer", "coder", or "verifier"
+            model: model name string
+            usage: dict with input/output token counts
+        """
+        if not usage:
+            return
+
+        # Normalize token keys (Anthropic uses input_tokens, OpenAI uses prompt_tokens)
+        inp = usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
+        out = usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
+
+        pricing = self._get_pricing(model)
+        cost = (inp * pricing["input"] + out * pricing["output"]) / 1_000_000
+
+        # Per-iteration tracking
+        if iteration not in self.iterations:
+            self.iterations[iteration] = {}
+        key = f"{role}/{model}"
+        if key not in self.iterations[iteration]:
+            self.iterations[iteration][key] = {
+                "role": role, "model": model,
+                "input_tokens": 0, "output_tokens": 0, "calls": 0, "cost": 0.0
+            }
+        entry = self.iterations[iteration][key]
+        entry["input_tokens"] += inp
+        entry["output_tokens"] += out
+        entry["calls"] += 1
+        entry["cost"] += cost
+
+        # Global totals
+        if model not in self.totals:
+            self.totals[model] = {"input_tokens": 0, "output_tokens": 0, "calls": 0, "cost": 0.0}
+        t = self.totals[model]
+        t["input_tokens"] += inp
+        t["output_tokens"] += out
+        t["calls"] += 1
+        t["cost"] += cost
+
+    def iteration_cost(self, iteration):
+        """Get total cost for one iteration."""
+        if iteration not in self.iterations:
+            return 0.0
+        return sum(e["cost"] for e in self.iterations[iteration].values())
+
+    def total_cost(self):
+        """Get total cost across all iterations."""
+        return sum(t["cost"] for t in self.totals.values())
+
+    def total_tokens(self):
+        """Get total input + output tokens."""
+        return sum(t["input_tokens"] + t["output_tokens"] for t in self.totals.values())
+
+    def summary_dict(self):
+        """Return a serializable summary for events/JSON."""
+        return {
+            "total_cost_usd": round(self.total_cost(), 4),
+            "total_input_tokens": sum(t["input_tokens"] for t in self.totals.values()),
+            "total_output_tokens": sum(t["output_tokens"] for t in self.totals.values()),
+            "per_iteration": {
+                str(it): {
+                    "cost_usd": round(sum(e["cost"] for e in entries.values()), 4),
+                    "input_tokens": sum(e["input_tokens"] for e in entries.values()),
+                    "output_tokens": sum(e["output_tokens"] for e in entries.values()),
+                    "calls": sum(e["calls"] for e in entries.values()),
+                }
+                for it, entries in sorted(self.iterations.items())
+            },
+            "per_model": {
+                model: {
+                    "input_tokens": t["input_tokens"],
+                    "output_tokens": t["output_tokens"],
+                    "calls": t["calls"],
+                    "cost_usd": round(t["cost"], 4),
+                }
+                for model, t in sorted(self.totals.items())
+            },
+        }
+
+    def print_summary(self):
+        """Print a human-readable cost summary."""
+        if not self.totals:
+            return
+
+        print(f"\n  Token Usage & Cost:")
+        print(f"  {'Model':<30s} {'Input':>10s} {'Output':>10s} {'Calls':>6s} {'Cost':>10s}")
+        print(f"  {'─'*30} {'─'*10} {'─'*10} {'─'*6} {'─'*10}")
+        for model, t in sorted(self.totals.items(), key=lambda x: -x[1]["cost"]):
+            cost_str = f"${t['cost']:.4f}" if t["cost"] > 0 else "free"
+            print(f"  {model:<30s} {t['input_tokens']:>10,} {t['output_tokens']:>10,} "
+                  f"{t['calls']:>6} {cost_str:>10s}")
+        total = self.total_cost()
+        total_in = sum(t["input_tokens"] for t in self.totals.values())
+        total_out = sum(t["output_tokens"] for t in self.totals.values())
+        total_calls = sum(t["calls"] for t in self.totals.values())
+        print(f"  {'─'*30} {'─'*10} {'─'*10} {'─'*6} {'─'*10}")
+        print(f"  {'TOTAL':<30s} {total_in:>10,} {total_out:>10,} "
+              f"{total_calls:>6} {'$'+f'{total:.4f}':>10s}")
+
+        if len(self.iterations) > 1:
+            print(f"\n  Per-Iteration Cost:")
+            for it in sorted(self.iterations.keys()):
+                ic = self.iteration_cost(it)
+                it_calls = sum(e["calls"] for e in self.iterations[it].values())
+                print(f"    Iteration {it}: ${ic:.4f} ({it_calls} calls)")
 
 
 class StructuredLogger:
@@ -421,6 +565,7 @@ def default_config():
             "max_iterations": 15,
             "max_coder_rounds": 20,
             "convergence_threshold": 0,
+            "max_growth_percent": 25,
             "timeout_seconds": 3600,
         },
         "test": {
@@ -446,7 +591,7 @@ def load_prompt_template(name):
     return ""
 
 
-def build_review_prompt(files_content, context="", standards=""):
+def build_review_prompt(files_content, context="", standards="", diff_text=""):
     """Build the review prompt with file contents injected."""
     template = load_prompt_template("reviewer")
     if not template:
@@ -456,8 +601,15 @@ def build_review_prompt(files_content, context="", standards=""):
     for name, content in files_content.items():
         file_list += f"\n### {name}\n```\n{content}\n```\n"
 
+    diff_section = ""
+    if diff_text:
+        diff_section = (f"\n## Changes Since Last Iteration\n"
+                        f"Pay special attention to these recent changes:\n"
+                        f"```diff\n{diff_text}\n```\n")
+
     result = template
     result = result.replace("{file_list}", file_list)
+    result = result.replace("{diff_section}", diff_section)
     result = result.replace("{context}", context or "General code review.")
     result = result.replace("{standards}", standards or "N/A")
     return result
@@ -773,6 +925,30 @@ def parse_search_replace_blocks(response):
     return blocks
 
 
+def parse_wont_fix(response):
+    """Parse WONT_FIX responses from coder.
+
+    Returns (is_wont_fix, reason, limitation_line) or (False, None, None).
+    """
+    if not response:
+        return False, None, None
+
+    # Check for WONT_FIX in finding header
+    wf_match = re.search(r'###\s*Finding.*?:\s*WONT_FIX', response, re.IGNORECASE)
+    if not wf_match:
+        return False, None, None
+
+    # Extract reason
+    reason_match = re.search(r'\*\*Reason\*\*:\s*(.+?)(?:\n|$)', response)
+    reason = reason_match.group(1).strip() if reason_match else "Platform limitation"
+
+    # Extract limitation line
+    lim_match = re.search(r'\*\*Limitation\*\*:\s*(.+?)(?:\n|$)', response)
+    limitation = lim_match.group(1).strip() if lim_match else reason
+
+    return True, reason, limitation
+
+
 def sanitize_replacement(text):
     """Strip stray SEARCH/REPLACE format markers from replacement text.
     These can leak when the coder echoes its own format into code."""
@@ -861,7 +1037,7 @@ def build_verify_prompt(diff_text, findings_text, context=""):
 
 
 def run_diff_verification(client, verifier, diff_text, findings_text, task_context,
-                          iteration, storage, logger, model_stats):
+                          iteration, storage, logger, model_stats, cost_tracker=None):
     """Run diff verification with the alternate T1 model.
 
     Returns list of BAD verdicts (empty = all good).
@@ -888,6 +1064,8 @@ def run_diff_verification(client, verifier, diff_text, findings_text, task_conte
 
         logger.event("verify_complete", iteration=iteration, label=label,
                      elapsed_s=round(dt, 1), usage=usage)
+        if cost_tracker:
+            cost_tracker.record(iteration, "verifier", model, usage)
 
         # Save verification response
         verify_dir = storage.run_dir / "verification"
@@ -1145,9 +1323,13 @@ def main():
 
     # Track per-model stats across iterations
     model_stats = {}  # label → {"total_findings": N, "api_calls": N, "errors": N}
+    cost_tracker = CostTracker()
 
     # Track findings that were already sent to the coder (cross-iteration dedup)
     addressed_fingerprints = set()
+
+    # Track WONT_FIX items across iterations
+    all_wont_fix = []
 
     # Track last known good state for revert-on-test-failure
     last_good_files = {name: content for name, content in files_content.items()}
@@ -1192,8 +1374,10 @@ def main():
 
         logger.event("iteration_start", iteration=iteration)
 
+        running_cost = cost_tracker.total_cost()
+        cost_str = f"  (${running_cost:.2f} so far)" if running_cost > 0 else ""
         print(f"╔══════════════════════════════════════════════════╗")
-        print(f"║  Iteration {iteration}/{max_iter}{'':>38}║")
+        print(f"║  Iteration {iteration}/{max_iter}{cost_str:>38}║")
         print(f"╚══════════════════════════════════════════════════╝")
 
         # ── Step 1: Tests ──
@@ -1305,7 +1489,16 @@ def main():
                      f"(T1: {active_t1[2] if t1_list else 'none'}"
                      f"{', verifier: ' + verifier_t1[2] if verifier_t1 else ''})...")
 
-        review_prompt = build_review_prompt(files_content, task_context, standards_text)
+        # Build diff from last iteration for diff-aware review
+        iter_diff = ""
+        if iteration > 1:
+            for filename in files_content:
+                old_ver = last_good_files.get(filename, "")
+                if old_ver != files_content[filename]:
+                    iter_diff += generate_diff(old_ver, files_content[filename], filename)
+
+        review_prompt = build_review_prompt(files_content, task_context, standards_text,
+                                            diff_text=iter_diff)
         messages = [
             {"role": "system", "content": "You are a senior code reviewer. Return findings as JSON array."},
             {"role": "user", "content": review_prompt},
@@ -1334,6 +1527,7 @@ def main():
                              provider=provider, model=model, tier=tier,
                              findings_count=len(findings), elapsed_s=round(dt, 1),
                              usage=usage)
+                cost_tracker.record(iteration, "reviewer", model, usage)
 
                 # Save raw response and findings
                 storage.save_review(iteration, label, response, findings)
@@ -1356,6 +1550,7 @@ def main():
                         findings = parse_review_response(response, label)
                         model_stats[label]["api_calls"] += 1
                         model_stats[label]["total_findings"] += len(findings)
+                        cost_tracker.record(iteration, "reviewer", model, usage)
                         storage.save_review(iteration, label, response, findings)
                         print(f"   ✅ {label}: {len(findings)} findings ({dt2:.1f}s, retry)")
                         return label, findings, tier
@@ -1447,234 +1642,229 @@ def main():
             print("\n📝 Review-only mode. Stopping.")
             break
 
-        # ── Step 6: Fix ──
-        logger.info(f"Sending {len(fix_items)} findings to coder...")
+        # ── Step 6: Fix (one finding at a time) ──
+        logger.info(f"Fixing {len(fix_items)} findings one at a time...")
+        wont_fix_items = []
+        max_growth = config.get("loop", {}).get("max_growth_percent", 25)
+        original_lines = sum(c.count('\n') + 1 for c in files_content.values())
+        any_fix_applied = False
 
-        findings_text = ""
-        for i, t in enumerate(fix_items, 1):
+        for fix_idx, t in enumerate(fix_items, 1):
             f = t["finding"]
-            findings_text += f"\n### Finding {i}. [{f['severity']}] {f['title']}\n"
-            findings_text += f"Location: {f.get('location', '?')}\n"
-            findings_text += f"Description: {f.get('description', '')}\n"
+            finding_text = f"\n### Finding: [{f['severity']}] {f['title']}\n"
+            finding_text += f"Location: {f.get('location', '?')}\n"
+            finding_text += f"Description: {f.get('description', '')}\n"
             if f.get("suggestion"):
-                findings_text += f"Suggested fix: {f['suggestion']}\n"
-            # Track this finding as addressed for cross-iteration dedup
-            if t.get("fingerprint"):
-                addressed_fingerprints.add(t["fingerprint"])
+                finding_text += f"Suggested fix: {f['suggestion']}\n"
 
-        fix_prompt = build_fix_prompt(files_content, findings_text, task_context)
-        storage.save_fix_request(iteration, fix_prompt)
+            print(f"\n   🔧 [{fix_idx}/{len(fix_items)}] [{f['severity']}] {f['title']}")
 
-        fix_messages = [
-            {"role": "system", "content": "You are a senior engineer. Fix the reported issues using "
-             "SEARCH/REPLACE blocks. Do NOT return the entire file — only the changed sections. "
-             "Use <<<SEARCH, >>>REPLACE, <<<END delimiters."},
-            {"role": "user", "content": fix_prompt},
-        ]
+            fix_prompt = build_fix_prompt(files_content, finding_text, task_context)
+            storage.save_fix_request(iteration, fix_prompt)
 
-        try:
-            fix_response, fix_usage = client.call(
-                coder_provider, coder_model, fix_messages, max_tokens=8192, timeout=600
-            )
-            storage.save_fix_response(iteration, fix_response)
+            fix_messages = [
+                {"role": "system", "content": "You are a senior engineer. Fix ONE issue using "
+                 "SEARCH/REPLACE blocks. Prefer minimal changes. If this is a platform limitation "
+                 "that cannot be fixed cleanly, respond with WONT_FIX. "
+                 "Use <<<SEARCH, >>>REPLACE, <<<END delimiters."},
+                {"role": "user", "content": fix_prompt},
+            ]
 
-            logger.event("coder_complete", iteration=iteration,
-                         provider=coder_provider, model=coder_model, usage=fix_usage)
+            try:
+                fix_response, fix_usage = client.call(
+                    coder_provider, coder_model, fix_messages, max_tokens=4096, timeout=300
+                )
+                storage.save_fix_response(iteration, fix_response)
 
-            # Parse SEARCH/REPLACE blocks
-            blocks = parse_search_replace_blocks(fix_response)
+                logger.event("coder_complete", iteration=iteration, fix_idx=fix_idx,
+                             finding=f['title'], provider=coder_provider, model=coder_model,
+                             usage=fix_usage)
+                cost_tracker.record(iteration, "coder", coder_model, fix_usage)
 
-            if blocks:
-                logger.info(f"Parsed {len(blocks)} SEARCH/REPLACE blocks")
+                # Check for WONT_FIX
+                is_wont_fix, wf_reason, wf_limitation = parse_wont_fix(fix_response)
+                if is_wont_fix:
+                    print(f"      ⏭️  WONT_FIX: {wf_reason}")
+                    logger.info(f"WONT_FIX: {f['title']} — {wf_reason}")
+                    wont_fix_items.append({
+                        "finding": f,
+                        "reason": wf_reason,
+                        "limitation": wf_limitation,
+                    })
+                    if t.get("fingerprint"):
+                        addressed_fingerprints.add(t["fingerprint"])
+                    logger.event("wont_fix", iteration=iteration, finding=f['title'],
+                                 reason=wf_reason, limitation=wf_limitation)
+                    continue
 
-                files_updated = False
+                # Parse and apply SEARCH/REPLACE blocks
+                blocks = parse_search_replace_blocks(fix_response)
+
+                if not blocks:
+                    # Check if coder said SKIPPED
+                    if re.search(r'###.*SKIPPED', fix_response, re.IGNORECASE):
+                        print(f"      ⏭️  Skipped by coder")
+                        if t.get("fingerprint"):
+                            addressed_fingerprints.add(t["fingerprint"])
+                        continue
+                    print(f"      ❌ No SEARCH/REPLACE blocks returned")
+                    continue
+
+                logger.info(f"Parsed {len(blocks)} SEARCH/REPLACE blocks for finding {fix_idx}")
+
+                fix_applied = False
                 for filename in list(files_content.keys()):
-                    old_content = files_content[filename]
+                    pre_fix_content = files_content[filename]
                     new_content, applied, failed = apply_search_replace(
-                        old_content, blocks, logger
+                        pre_fix_content, blocks, logger
                     )
 
                     if applied > 0:
-                        files_content[filename] = new_content
-                        files_updated = True
+                        # Bloat guard: check line growth
+                        pre_lines = pre_fix_content.count('\n') + 1
+                        post_lines = new_content.count('\n') + 1
+                        total_now = sum(c.count('\n') + 1 for c in files_content.values()) - pre_lines + post_lines
+                        growth_pct = ((total_now - original_lines) / original_lines) * 100
 
-                        # Save to storage and write back to disk
+                        if growth_pct > max_growth:
+                            logger.warn(f"Bloat guard: +{growth_pct:.0f}% growth exceeds "
+                                        f"{max_growth}% limit, reverting this fix")
+                            print(f"      ⚠️  Bloat guard: +{growth_pct:.0f}% growth — reverted")
+                            logger.event("bloat_revert", iteration=iteration,
+                                         finding=f['title'], growth_pct=round(growth_pct, 1))
+                            break
+
+                        files_content[filename] = new_content
+                        fix_applied = True
+                        any_fix_applied = True
+
+                        # Write back to disk
                         storage.save_iteration_file(iteration, filename, new_content)
                         for fp in args.files:
                             if Path(fp).name == filename:
                                 Path(fp).write_text(new_content)
                                 break
 
-                        old_lines = old_content.count('\n') + 1
-                        new_lines = new_content.count('\n') + 1
-                        logger.info(f"Updated {filename}: {applied} applied, {failed} failed "
-                                    f"({old_lines} → {new_lines} lines)")
+                        print(f"      ✅ Applied ({pre_lines} → {post_lines} lines"
+                              f"{f', total +{growth_pct:.0f}%' if growth_pct > 0 else ''})")
                         logger.event("file_updated", iteration=iteration, filename=filename,
-                                     old_lines=old_lines, new_lines=new_lines,
-                                     old_size=len(old_content), new_size=len(new_content),
+                                     finding=f['title'],
+                                     old_lines=pre_lines, new_lines=post_lines,
+                                     growth_pct=round(growth_pct, 1),
                                      patches_applied=applied, patches_failed=failed)
-                    else:
-                        logger.warn(f"No patches applied to {filename} ({failed} failed)")
 
-                if not files_updated:
-                    # Fallback: try legacy full-file extraction
-                    logger.info("No SEARCH/REPLACE blocks applied, trying full-file fallback...")
-                    for filename in list(files_content.keys()):
-                        new_code = extract_code_from_response(fix_response, filename)
-                        if new_code and len(new_code.strip()) > 100:
-                            old_len = len(files_content[filename])
-                            new_len = len(new_code)
-                            if new_len >= old_len * 0.5:
-                                files_content[filename] = new_code
-                                files_updated = True
-                                storage.save_iteration_file(iteration, filename, new_code)
-                                for fp in args.files:
-                                    if Path(fp).name == filename:
-                                        Path(fp).write_text(new_code)
-                                        break
-                                logger.info(f"Fallback: updated {filename} ({old_len} → {new_len} chars, "
-                                            f"{files_content[filename].count(chr(10))+1} → {new_code.count(chr(10))+1} lines)")
+                if fix_applied and t.get("fingerprint"):
+                    addressed_fingerprints.add(t["fingerprint"])
 
-                    if not files_updated:
-                        logger.warn("No files updated, breaking loop")
-                        break
-            else:
-                # No SEARCH/REPLACE blocks found — try legacy extraction
-                logger.info("No SEARCH/REPLACE blocks found, trying full-file extraction...")
-                files_updated = False
-                for filename in list(files_content.keys()):
-                    new_code = extract_code_from_response(fix_response, filename)
-                    if new_code and len(new_code.strip()) > 100:
-                        old_len = len(files_content[filename])
-                        new_len = len(new_code)
-                        if new_len >= old_len * 0.5:
-                            files_content[filename] = new_code
-                            files_updated = True
-                            storage.save_iteration_file(iteration, filename, new_code)
-                            for fp in args.files:
-                                if Path(fp).name == filename:
-                                    Path(fp).write_text(new_code)
-                                    break
-                            old_lines = files_content[filename].count('\n') + 1
-                            new_lines = new_code.count('\n') + 1
-                            logger.info(f"Updated {filename} ({old_lines} → {new_lines} lines)")
+                if not fix_applied and not blocks:
+                    logger.warn(f"No patches applied for finding {fix_idx}")
 
-                if not files_updated:
-                    logger.warn("No files updated, breaking loop")
-                    break
-
-            # ── Step 7: Diff verification ──
-            if verifier_t1 and files_updated:
-                # Generate diff between pre-fix and post-fix content
-                for filename in list(files_content.keys()):
-                    pre_fix = last_good_files.get(filename, "")
-                    post_fix = files_content[filename]
-                    if pre_fix != post_fix:
-                        diff_text = generate_diff(pre_fix, post_fix, filename)
-                        if diff_text:
-                            bad_verdicts = run_diff_verification(
-                                client, verifier_t1, diff_text, findings_text,
-                                task_context, iteration, storage, logger, model_stats
-                            )
-                            if bad_verdicts:
-                                logger.warn(f"Verifier found {len(bad_verdicts)} bad fix(es), reverting")
-                                # Revert to pre-fix state
-                                files_content = {name: content for name, content in last_good_files.items()}
-                                for fn, content in files_content.items():
+            except Exception as e:
+                retry_codes = ("401", "403", "429", "timeout", "Connection")
+                if any(code in str(e) for code in retry_codes):
+                    logger.warn(f"Coder failed on finding {fix_idx} (retrying in 5s): {e}")
+                    print(f"      ⚠️  {e} — retrying in 5s...")
+                    time.sleep(5)
+                    try:
+                        fix_response, fix_usage = client.call(
+                            coder_provider, coder_model, fix_messages, max_tokens=4096, timeout=300
+                        )
+                        blocks = parse_search_replace_blocks(fix_response)
+                        if blocks:
+                            for filename in list(files_content.keys()):
+                                old_c = files_content[filename]
+                                new_c, applied, failed = apply_search_replace(old_c, blocks, logger)
+                                if applied > 0:
+                                    files_content[filename] = new_c
+                                    any_fix_applied = True
+                                    storage.save_iteration_file(iteration, filename, new_c)
                                     for fp in args.files:
-                                        if Path(fp).name == fn:
-                                            Path(fp).write_text(content)
+                                        if Path(fp).name == filename:
+                                            Path(fp).write_text(new_c)
                                             break
-                                logger.event("revert", iteration=iteration,
-                                             reason="verifier rejected fixes",
-                                             bad_verdicts=len(bad_verdicts))
-                                files_updated = False
-                                break
-
-            if not files_updated:
-                # Was reverted by verifier — skip tests, continue to next iteration
-                print("   🔄 Reverted by verifier, continuing...")
-                continue
-
-            # Verification passed — update last known good state
-            last_good_files = {name: content for name, content in files_content.items()}
-
-            # ── Step 8: Post-fix tests ──
-            if test_cmd and config["test"]["after_fix"]:
-                logger.info("Running post-fix tests...")
-                test_ok, test_out = run_tests(test_cmd)
-                storage.save_test_output(iteration, "post", test_ok, test_out)
-                logger.event("test_run", iteration=iteration, phase="post", passed=test_ok)
-                if test_ok:
-                    print("   ✅ Post-fix tests pass")
-                    # Update last known good state
-                    last_good_files = {name: content for name, content in files_content.items()}
-                    logger.info("Snapshot saved as last known good state")
+                                    print(f"      ✅ Applied [retry]")
+                                    if t.get("fingerprint"):
+                                        addressed_fingerprints.add(t["fingerprint"])
+                    except Exception as e2:
+                        logger.error(f"Coder retry failed for finding {fix_idx}: {e2}")
+                        print(f"      ❌ Retry failed: {e2}")
                 else:
-                    print(f"   ❌ Post-fix tests failed — reverting to last good version")
-                    logger.warn("Tests failed after fix, reverting to last good state",
-                                test_output=test_out[:500])
+                    logger.error(f"Coder failed on finding {fix_idx}: {e}")
+                    print(f"      ❌ Error: {e}")
 
-                    # Revert files to last known good state
-                    files_content = {name: content for name, content in last_good_files.items()}
-                    for filename, content in files_content.items():
-                        for fp in args.files:
-                            if Path(fp).name == filename:
-                                Path(fp).write_text(content)
-                                break
-                    storage.save_iteration_file(iteration, "REVERTED", "Reverted to last good state")
-                    logger.event("revert", iteration=iteration, reason="post-fix tests failed")
+        # Report WONT_FIX items
+        if wont_fix_items:
+            print(f"\n   📋 {len(wont_fix_items)} WONT_FIX (platform limitations):")
+            for wf in wont_fix_items:
+                print(f"      • {wf['limitation']}")
+            all_wont_fix.extend(wont_fix_items)
+            logger.event("wont_fix_summary", iteration=iteration,
+                         count=len(wont_fix_items),
+                         items=[wf['limitation'] for wf in wont_fix_items])
 
-        except Exception as e:
-            # Retry once for transient errors (401, 403, 429, timeouts)
-            retry_codes = ("401", "403", "429", "timeout", "Connection")
-            if any(code in str(e) for code in retry_codes):
-                logger.warn(f"Coder failed (retrying in 10s): {e}")
-                print(f"   ⚠️  Coder failed — retrying in 10s...")
-                time.sleep(10)
-                try:
-                    fix_response, fix_usage = client.call(
-                        coder_provider, coder_model, fix_messages, max_tokens=16384, timeout=600
-                    )
-                    storage.save_fix_response(iteration, fix_response)
-                    blocks = parse_search_replace_blocks(fix_response)
-                    if blocks:
-                        files_updated = False
-                        for filename in list(files_content.keys()):
-                            old_content = files_content[filename]
-                            new_content, applied, failed = apply_search_replace(
-                                old_content, blocks, logger
-                            )
-                            if applied > 0:
-                                files_content[filename] = new_content
-                                files_updated = True
-                                storage.save_iteration_file(iteration, filename, new_content)
+        # ── Step 7: Diff verification (of all changes this iteration) ──
+        if verifier_t1 and any_fix_applied:
+            findings_text = "\n".join(f"- [{t['finding']['severity']}] {t['finding']['title']}"
+                                      for t in fix_items)
+            for filename in list(files_content.keys()):
+                pre_fix = last_good_files.get(filename, "")
+                post_fix = files_content[filename]
+                if pre_fix != post_fix:
+                    diff_text = generate_diff(pre_fix, post_fix, filename)
+                    if diff_text:
+                        logger.info(f"🔍 Diff verification by {verifier_t1[2]}...")
+                        bad_verdicts = run_diff_verification(
+                            client, verifier_t1, diff_text, findings_text,
+                            task_context, iteration, storage, logger, model_stats,
+                            cost_tracker
+                        )
+                        if bad_verdicts:
+                            logger.warn(f"Verifier found {len(bad_verdicts)} bad fix(es), reverting")
+                            print(f"   🔄 Verifier rejected {len(bad_verdicts)} fix(es), reverting all")
+                            files_content = {name: content for name, content in last_good_files.items()}
+                            for fn, content in files_content.items():
                                 for fp in args.files:
-                                    if Path(fp).name == filename:
-                                        Path(fp).write_text(new_content)
+                                    if Path(fp).name == fn:
+                                        Path(fp).write_text(content)
                                         break
-                                old_lines = old_content.count('\n') + 1
-                                new_lines = new_content.count('\n') + 1
-                                print(f"   ✅ {filename}: {applied} applied, {failed} failed "
-                                      f"({old_lines} → {new_lines} lines) [retry]")
-                        if files_updated:
-                            last_good_files = {name: content for name, content in files_content.items()}
-                            storage.save_checkpoint(iteration, files_content, model_stats,
-                                                    addressed_fingerprints, last_good_files)
-                            print()
-                            continue
-                except Exception as e2:
-                    logger.error(f"Coder retry failed: {e2}")
-                    print(f"   ❌ Coder retry failed: {e2}")
+                            logger.event("revert", iteration=iteration,
+                                         reason="verifier rejected fixes",
+                                         bad_verdicts=len(bad_verdicts))
+                            any_fix_applied = False
+                            break
 
-            logger.error(f"Coder failed: {e}")
-            storage.save_fix_response(iteration, f"ERROR: {e}")
-            # Save checkpoint before halting so we can resume
-            storage.save_checkpoint(iteration, files_content, model_stats,
-                                    addressed_fingerprints, last_good_files)
-            logger.info(f"Checkpoint saved at iteration {iteration} (coder failed)")
-            print(f"\n   💾 Checkpoint saved — resume with: --resume {storage.run_dir}")
-            break
+        if not any_fix_applied:
+            if wont_fix_items:
+                print("   ℹ️  All findings were WONT_FIX or skipped")
+            else:
+                print("   🔄 No fixes applied this iteration, continuing...")
+            continue
+
+        # Update last known good state
+        last_good_files = {name: content for name, content in files_content.items()}
+
+        # ── Step 8: Post-fix tests ──
+        if test_cmd and config["test"]["after_fix"]:
+            logger.info("Running post-fix tests...")
+            test_ok, test_out = run_tests(test_cmd)
+            storage.save_test_output(iteration, "post", test_ok, test_out)
+            logger.event("test_run", iteration=iteration, phase="post", passed=test_ok)
+            if test_ok:
+                print("   ✅ Post-fix tests pass")
+                last_good_files = {name: content for name, content in files_content.items()}
+                logger.info("Snapshot saved as last known good state")
+            else:
+                print(f"   ❌ Post-fix tests failed — reverting to last good version")
+                logger.warn("Tests failed after fix, reverting to last good state",
+                            test_output=test_out[:500])
+                files_content = {name: content for name, content in last_good_files.items()}
+                for filename, content in files_content.items():
+                    for fp in args.files:
+                        if Path(fp).name == filename:
+                            Path(fp).write_text(content)
+                            break
+                storage.save_iteration_file(iteration, "REVERTED", "Reverted to last good state")
+                logger.event("revert", iteration=iteration, reason="post-fix tests failed")
 
         # Save checkpoint after each successful iteration
         storage.save_checkpoint(iteration, files_content, model_stats,
@@ -1691,6 +1881,7 @@ def main():
         "iterations": iteration,
         "elapsed_seconds": round(elapsed, 1),
         "model_stats": model_stats,
+        "cost": cost_tracker.summary_dict(),
         "run_dir": str(storage.run_dir),
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1698,12 +1889,21 @@ def main():
     logger.event("run_complete", **summary)
     logger.close()
 
+    # Save cost data separately for easy comparison
+    cost_path = storage.run_dir / "cost.json"
+    cost_path.write_text(json.dumps(cost_tracker.summary_dict(), indent=2))
+
     print()
     print("=" * 60)
-    print(f"  NEURON-LOOP COMPLETE")
+    print(f"  NEURON-LOOP v{VERSION} COMPLETE")
     print(f"  Iterations:  {iteration}")
     print(f"  Elapsed:     {elapsed:.0f}s")
     print(f"  Run dir:     {storage.run_dir}")
+    if all_wont_fix:
+        print(f"\n  Known Limitations ({len(all_wont_fix)}):")
+        for wf in all_wont_fix:
+            print(f"    • {wf['limitation']}")
+    cost_tracker.print_summary()
     print()
     print("  Model Stats:")
     for label, stats in model_stats.items():

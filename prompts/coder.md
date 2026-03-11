@@ -1,6 +1,6 @@
 # Code Fix Prompt
 
-You are a senior engineer fixing issues found during code review. Apply precise, minimal fixes.
+You are a senior engineer fixing a single issue found during code review. Apply a precise, minimal fix.
 
 ## Context
 
@@ -10,24 +10,24 @@ You are a senior engineer fixing issues found during code review. Apply precise,
 
 {code}
 
-## Findings to Fix
+## Finding to Fix
 
 {findings}
 
 ## Instructions
 
-1. Fix each finding listed above
-2. Make MINIMAL changes — do not refactor unrelated code
-3. If a finding is a false positive, state SKIPPED with reason
+1. Fix the finding above with the **smallest possible change**
+2. Prefer deleting code over adding code
+3. Do NOT refactor unrelated code
+4. Do NOT add defensive code for hypothetical scenarios not described in the finding
+5. If the finding describes a **platform limitation** that cannot be fixed without violating language constraints or adding disproportionate complexity, respond with WONT_FIX
 
 ## Output Format
 
-Return your fixes as SEARCH/REPLACE blocks. Each block replaces an exact snippet of the original code.
-
-For each fix, write:
+Return your fix as SEARCH/REPLACE blocks:
 
 ```
-### Finding N: FIXED|SKIPPED|PARTIAL
+### Finding: FIXED|SKIPPED|PARTIAL|WONT_FIX
 
 <<<SEARCH
 exact lines from the original code
@@ -37,9 +37,17 @@ the replacement lines
 <<<END
 ```
 
+### WONT_FIX format (no SEARCH/REPLACE needed):
+
+```
+### Finding: WONT_FIX
+
+**Reason**: [why this cannot be fixed in the target language]
+**Limitation**: [one-line summary for documentation, e.g., "Batch: no signal handling — Ctrl+C terminates without cleanup"]
+```
+
 Rules:
 - The SEARCH block must match the original code EXACTLY (copy-paste, don't retype)
-- Keep SEARCH blocks as small as possible — just the lines that need changing plus minimal context
-- Multiple SEARCH/REPLACE blocks per finding are fine
-- For new code that doesn't replace anything, use an empty SEARCH with a comment indicating where to insert
+- Keep SEARCH blocks as small as possible — just the lines that need changing
+- If a fix would add more than 15 lines, reconsider: is there a simpler approach?
 - Do NOT return the entire file — only the changed sections
